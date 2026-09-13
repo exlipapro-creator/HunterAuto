@@ -1,0 +1,58 @@
+# Hunter Autoworks — daily logical backup (replaces the paid-only Render Cron Job).
+# Free mechanism: GitHub Actions scheduled workflow (free for private repos,
+# ~2,000 free minutes/month; this job uses ~1 minute/day).
+#
+# What it does: exports all 28 tables from the EXISTING Supabase project to a
+# checksummed JSON bundle and uploads it OFF-SITE into the project's private
+# Supabase Storage bucket `hunter-backups` (public=false, service-role only),
+# then prunes retention to the newest 14 bundles. The same proven script the
+# Render cron would have run: scripts/backup-database.mjs (Phase G verified).
+#
+# REQUIRED REPO SECRETS (Settings → Secrets and variables → Actions):
+#   SUPABASE_URL             — the existing Supabase project URL (server-side use)
+#   SUPABASE_SERVICE_ROLE_KEY — SERVER-ONLY secret. Never log it, never echo it,
+#                               never put it in any VITE_ variable or client code.
+#
+# Schedule 02:30 UTC = 05:30 EAT (outside workshop hours). Manual runs allowed
+# via workflow_dispatch for on-demand backups.
+name: daily-database-backup
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # daily 02:30 UTC — outside workshop hours (EAT +3: 05:30)
+  workflow_dispatch: {} # manual on-demand backup
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-database-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --omit=dev --ignore-scripts
+
+      - name: Export, checksum, upload off-site, prune retention
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BACKUP_UPLOAD: "1"
+          BACKUP_KEEP: "14"
+        run: node scripts/backup-database.mjs
+
+      # The job's local bundle is ephemeral (GitHub runners are disposable);
+      # durability comes from the off-site Supabase Storage upload above.
+      # Failure visibility: a red run appears in the Actions tab; add email
+      # notifications via GitHub Settings → Notifications → Actions if wanted.

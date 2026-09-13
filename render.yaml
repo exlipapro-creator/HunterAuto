@@ -1,21 +1,31 @@
 # Render deployment configuration for Hunter Autoworks.
 # Non-secret configuration ONLY — every credential is supplied through the
 # Render Dashboard environment groups (see artifacts/operations/RENDER-DEPLOYMENT.md).
+#
+# FREE-PLAN NOTES (deliberate choices, 2026-09-13):
+# - Web service uses `plan: free`. Free instances spin down after ~15 min
+#   idle (first visitor after idle waits ~30-60 s for spin-up) and do not
+#   support zero-downtime deploys. Upgrade to `starter` for always-on.
+# - `healthCheckPath` is a paid-plan feature and is therefore omitted; on
+#   free, Render considers the service live when it binds $PORT (our server
+#   does so immediately). The readiness endpoint /api/v1/health remains
+#   available for monitoring and live-smoke.
+# - Render Cron Jobs are paid-only, so the daily backup (E-5) runs as a
+#   GitHub Actions schedule instead: .github/workflows/backup.yml (free),
+#   using the same scripts/backup-database.mjs + Supabase Storage off-site.
 services:
   - type: web
     name: hunter-autoworks
     runtime: node
-    plan: starter
+    plan: free
     region: oregon
     branch: master # must match the repo's actual default branch (verified: master)
-
     autoDeploy: true
     # Single-service architecture: the existing Express server serves both the
     # built React frontend (dist/) and the /api/v1 API — matching the current
     # codebase exactly (server.ts serves dist + API in NODE_ENV=production).
     buildCommand: npm ci && npm run build
     startCommand: npm start
-    healthCheckPath: /api/v1/health
     envVars:
       - key: NODE_ENV
         value: production
@@ -29,25 +39,3 @@ services:
         sync: false # server-only Supabase project URL
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false # SERVER-ONLY secret — must NEVER be prefixed VITE_ or logged
-      # Optional operational variables:
-      # BACKUP_UPLOAD / BACKUP_KEEP belong on the backup Cron Job, not the web service.
-
-  # E-5 backup schedule: daily logical backup, uploaded off-instance into the
-  # project's private Supabase Storage bucket `hunter-backups` (Render cron
-  # instances have ephemeral disks — local files do not survive the job).
-  - type: cron
-    name: hunter-autoworks-backup
-    runtime: node
-    plan: starter
-    region: oregon
-    branch: master
-    schedule: "30 2 * * *" # daily 02:30 UTC — outside workshop hours (EAT +3: 05:30)
-    buildCommand: npm ci
-    # The backup script reads SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY from env
-    # (never from a committed .env) and uploads to Supabase Storage.
-    startCommand: BACKUP_UPLOAD=1 BACKUP_KEEP=14 node scripts/backup-database.mjs
-    envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
