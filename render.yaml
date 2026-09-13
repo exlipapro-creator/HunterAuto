@@ -1,0 +1,53 @@
+# Render deployment configuration for Hunter Autoworks.
+# Non-secret configuration ONLY — every credential is supplied through the
+# Render Dashboard environment groups (see artifacts/operations/RENDER-DEPLOYMENT.md).
+services:
+  - type: web
+    name: hunter-autoworks
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main # the branch you connect in Render — change here if your default branch differs
+
+    autoDeploy: true
+    # Single-service architecture: the existing Express server serves both the
+    # built React frontend (dist/) and the /api/v1 API — matching the current
+    # codebase exactly (server.ts serves dist + API in NODE_ENV=production).
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22" # every regression suite was verified on Node 22
+      - key: VITE_SUPABASE_URL
+        sync: false # public project URL — safe to expose, still injected via dashboard
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false # public publishable key — safe to expose by design (src/lib/supabase.ts)
+      - key: SUPABASE_URL
+        sync: false # server-only Supabase project URL
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false # SERVER-ONLY secret — must NEVER be prefixed VITE_ or logged
+      # Optional operational variables:
+      # BACKUP_UPLOAD / BACKUP_KEEP belong on the backup Cron Job, not the web service.
+
+  # E-5 backup schedule: daily logical backup, uploaded off-instance into the
+  # project's private Supabase Storage bucket `hunter-backups` (Render cron
+  # instances have ephemeral disks — local files do not survive the job).
+  - type: cron
+    name: hunter-autoworks-backup
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "30 2 * * *" # daily 02:30 UTC — outside workshop hours (EAT +3: 05:30)
+    buildCommand: npm ci
+    # The backup script reads SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY from env
+    # (never from a committed .env) and uploads to Supabase Storage.
+    startCommand: BACKUP_UPLOAD=1 BACKUP_KEEP=14 node scripts/backup-database.mjs
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false

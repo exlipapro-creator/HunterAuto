@@ -1,0 +1,6 @@
+{
+  "name": "Hunter Autoworks | The Car Lab",
+  "description": "Premier automotive engineering, digital workshop operations, vehicle passports, and customer service portal for Hunter Autoworks in Kinondoni, Dar es Salaam.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

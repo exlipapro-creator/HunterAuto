@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+# Never push operational artifacts: backup bundles contain customer rows,
+# screenshots show real business data, audit tooling is internal.
+artifacts/
+# Legacy prototype JSON store — customer PII, never leaves the machine.
+data/
+
+node

@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --hunter-black: #000000;
+    --hunter-navy: #00101F;
+    --deep-hunter-blue: #002958;
+    --electric-blue: #159EF3;
+    --white: #FFFFFF;
+  }
+
+  body {
+    background-color: #000000;
+    color: #F8FAFC;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: 'Chakra Petch', sans-serif;
+    letter-spacing: -0.02em;
+  }
+
+  .font-mono-telemetry {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Custom scrollbar for dense data surfaces */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #00101F;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #132038;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #159EF3;
+}
+
+/* Technical tracing lines */
+.tech-grid-bg {
+  background-image: linear-gradient(to right, rgba(21, 158, 243, 0.05) 1px, transparent 1px),
+                    linear-gradient(to bottom, rgba(21, 158, 243, 0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.tech-dot-bg {
+  background-image: radial-gradient(rgba(21, 158, 243, 0.15) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
