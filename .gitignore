@@ -10,6 +10,7 @@ coverage/
 # screenshots show real business data, audit tooling is internal.
 artifacts/
 # Legacy prototype JSON store — customer PII, never leaves the machine.
-data/
+# Root-anchored: must NOT match src/data/ (source files live there).
+/data/
 
 node
