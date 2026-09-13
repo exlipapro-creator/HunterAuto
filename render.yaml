@@ -40,9 +40,8 @@ services:
     runtime: node
     plan: starter
     region: oregon
-    branch: main
-    schedule: "30 2 * * *" # daily 02:30 UTC — outside workshop hours (EAT +3: 05:30)
     branch: master
+    schedule: "30 2 * * *" # daily 02:30 UTC — outside workshop hours (EAT +3: 05:30)
     buildCommand: npm ci
     # The backup script reads SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY from env
     # (never from a committed .env) and uploads to Supabase Storage.
