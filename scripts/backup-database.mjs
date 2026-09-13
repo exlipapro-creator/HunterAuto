@@ -66,8 +66,20 @@ const counts = {};
 for (const t of TABLES) {
   let rows = [], from = 0, loop = true;
   while (loop) {
-    const { data, error } = await admin.from(t).select('*').range(from, from + 999);
-    if (error) { console.error(`EXPORT FAILED ${t}: ${error.message}`); process.exit(1); }
+    // Transient gateway/compute errors (Supabase 504s, free-tier compute
+    // wake-ups) must be retried — a scheduled backup that dies on the first
+    // blip is operationally useless. 4 attempts, exponential-ish backoff.
+    let data = null, error = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const res = await admin.from(t).select('*').range(from, from + 999);
+      data = res.data; error = res.error;
+      if (!error) break;
+      const retryable = /timeout|gateway|502|503|504|fetch failed|network/i.test(error.message) || !error.code;
+      console.warn(`  ${t}: attempt ${attempt} failed — ${error.message}${retryable ? ' (retrying…)' : ''}`);
+      if (!retryable || attempt === 4) break;
+      await new Promise((r) => setTimeout(r, attempt * 2000));
+    }
+    if (error) { console.error(`EXPORT FAILED ${t} after retries: ${error.message}`); process.exit(1); }
     rows = rows.concat(data ?? []);
     if ((data ?? []).length < 1000) loop = false; else from += 1000;
   }
