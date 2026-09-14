@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   LayoutDashboard,
   Gauge,
@@ -13,7 +13,9 @@ import {
   Users,
   UserCog,
   LogOut,
-  ArrowLeft
+  ArrowLeft,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { HunterLogo } from '../brand/HunterLogo';
 import type { StaffAuthUser } from '../../lib/supabase';
@@ -64,6 +66,50 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
 }) => {
   const visibleNav = NAV_ITEMS.filter((item) => item.allowedRoles.includes(staffUser.role));
 
+  // Desktop navigation overflow support: when the tab row exceeds the
+  // viewport, chevron controls appear (mobile/touch scrolling is unchanged)
+  // and the active tab auto-scrolls itself into view.
+  const navScrollRef = useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const updateScrollState = useCallback(() => {
+    const el = navScrollRef.current;
+    if (!el) return;
+    const maxScroll = el.scrollWidth - el.clientWidth;
+    setCanScrollLeft(el.scrollLeft > 4);
+    setCanScrollRight(el.scrollLeft < maxScroll - 4);
+  }, []);
+
+  useEffect(() => {
+    updateScrollState();
+    const el = navScrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(updateScrollState);
+    ro.observe(el);
+    el.addEventListener('scroll', updateScrollState, { passive: true });
+    window.addEventListener('resize', updateScrollState);
+    return () => {
+      ro.disconnect();
+      el.removeEventListener('scroll', updateScrollState);
+      window.removeEventListener('resize', updateScrollState);
+    };
+  }, [updateScrollState]);
+
+  // Active route auto-scrolls into view (block:'nearest' avoids page jumps).
+  useEffect(() => {
+    const el = navScrollRef.current;
+    if (!el) return;
+    const btn = el.querySelector(`#control-tab-${CSS.escape(currentTab)}`);
+    btn?.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'smooth' });
+  }, [currentTab, visibleNav.length]);
+
+  const scrollNav = (dir: -1 | 1) => {
+    const el = navScrollRef.current;
+    if (!el) return;
+    el.scrollBy({ left: dir * Math.max(240, Math.round(el.clientWidth * 0.7)), behavior: 'smooth' });
+  };
+
   return (
     <div className="min-h-screen bg-[#000000] text-slate-100 flex flex-col" id="hunter-control-root">
       {/* Top Staff Navigation Header */}
@@ -108,9 +154,24 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
         </div>
       </header>
 
-      {/* Sub Navigation Tabs Bar (Scrollable for mobile/tablet) */}
-      <div className="bg-[#000000] border-b border-[#132038] px-4 sm:px-6 overflow-x-auto scrollbar-none">
-        <nav className="flex items-center gap-1.5 py-2 min-w-max" aria-label="Staff sections">
+      {/* Sub Navigation Tabs Bar — horizontally scrollable; desktop chevrons
+          appear only while the tab set overflows, and the active tab always
+          scrolls itself into view. Mobile touch scrolling is unchanged. */}
+      <div className="bg-[#000000] border-b border-[#132038] px-2 sm:px-4">
+        <div className="flex items-center">
+          {canScrollLeft && (
+            <button
+              onClick={() => scrollNav(-1)}
+              className="shrink-0 my-1.5 mr-1 p-1.5 rounded text-slate-400 hover:text-white hover:bg-slate-900 border border-[#132038] transition-colors"
+              aria-label="Scroll staff navigation left"
+              title="Scroll navigation left"
+              id="nav-scroll-left"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+          )}
+          <div ref={navScrollRef} className="overflow-x-auto scrollbar-none flex-1 min-w-0">
+            <nav className="flex items-center gap-1.5 py-2 min-w-max" aria-label="Staff sections">
           {visibleNav.map((item) => {
             const Icon = item.icon;
             const isActive = currentTab === item.id;
@@ -131,7 +192,20 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
               </button>
             );
           })}
-        </nav>
+            </nav>
+          </div>
+          {canScrollRight && (
+            <button
+              onClick={() => scrollNav(1)}
+              className="shrink-0 my-1.5 ml-1 p-1.5 rounded text-slate-400 hover:text-white hover:bg-slate-900 border border-[#132038] transition-colors"
+              aria-label="Scroll staff navigation right"
+              title="Scroll navigation right"
+              id="nav-scroll-right"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Main Content Surface */}

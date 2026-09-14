@@ -40,6 +40,22 @@ export function repositoryBackend(): 'supabase' | 'json' {
 // ---------- Row ⇄ domain mapping helpers ----------
 type Row = Record<string, any>;
 
+/** Editable product fields accepted by createProduct/updateProduct. */
+export interface ProductInput {
+  name?: string;
+  sku?: string;
+  partNumber?: string;
+  category?: string;
+  costPrice?: number;
+  sellingPrice?: number;
+  reorderLevel?: number;
+  unit?: string;
+  binLocation?: string;
+  supplierId?: string;
+  initialStock?: number;
+  active?: boolean;
+}
+
 const mapService = (r: Row): ServiceItem => ({
   id: r.legacy_id ?? r.id,
   number: r.number,
@@ -149,6 +165,12 @@ export interface HunterRepository {
   getInventory(): Promise<InventoryItem[]>;
   getInventoryMovements(): Promise<InventoryMovement[]>;
   adjustInventoryStock(itemId: string, delta: number, reason: string, actor: string, ref?: string): Promise<{ success: boolean; item?: InventoryItem; error?: string }>;
+  adjustInventoryStockById(productUuid: string, sku: string, delta: number, reason: string, actor: string, actorId?: string | null, movementType?: 'PURCHASE' | 'ADJUSTMENT' | 'RETURN'): Promise<{ success: boolean; item?: InventoryItem; error?: string }>;
+  getSuppliers(): Promise<Array<{ id: string; name: string; contactPerson?: string; phone?: string }>>;
+  createProduct(p: ProductInput, actor: string, actorId?: string | null): Promise<{ success: boolean; item?: InventoryItem; error?: string }>;
+  updateProduct(id: string, p: ProductInput, actor: string): Promise<{ success: boolean; item?: InventoryItem; error?: string }>;
+  setProductActive(id: string, active: boolean, actor: string, actorId?: string | null): Promise<{ success: boolean; item?: InventoryItem; error?: string }>;
+  deleteProduct(id: string, actor: string): Promise<{ success: boolean; error?: string }>;
   processPosSale(data: any): Promise<{ success: boolean; sale?: any; receipt?: Invoice; error?: string }>;
   getInvoices(): Promise<Invoice[]>;
   getInvoiceByNumber(num: string): Promise<Invoice | undefined>;
@@ -209,6 +231,12 @@ const jsonRepo: HunterRepository = {
   getInventory: async () => jsonDb.getInventory(),
   getInventoryMovements: async () => jsonDb.getInventoryMovements(),
   adjustInventoryStock: async (id, d, r, a, ref) => jsonDb.adjustInventoryStock(id, d, r, a, ref),
+  adjustInventoryStockById: async () => ({ success: false, error: 'Inventory management requires the Supabase backend' }),
+  getSuppliers: async () => [],
+  createProduct: async () => ({ success: false, error: 'Inventory management requires the Supabase backend' }),
+  updateProduct: async () => ({ success: false, error: 'Inventory management requires the Supabase backend' }),
+  setProductActive: async () => ({ success: false, error: 'Inventory management requires the Supabase backend' }),
+  deleteProduct: async () => ({ success: false, error: 'Inventory management requires the Supabase backend' }),
   processPosSale: async (d) => jsonDb.processPosSale(d),
   getInvoices: async () => jsonDb.getInvoices(),
   getInvoiceByNumber: async (n) => jsonDb.getInvoiceByNumber(n),
@@ -223,6 +251,40 @@ const jsonRepo: HunterRepository = {
 
 // ---------- Supabase implementation ----------
 const SLOT_TIMES = ['08:30', '09:30', '10:30', '11:30', '12:30', '14:00', '15:00', '16:00', '17:00'];
+
+/** Row → domain InventoryItem (same shape as getInventory's mapper). */
+function mapProductRow(r: Row): InventoryItem {
+  return {
+    id: r.legacy_id ?? r.id,
+    sku: r.sku,
+    partNumber: r.part_number ?? undefined,
+    name: r.name,
+    category: r.category,
+    costPrice: Number(r.cost_price),
+    sellingPrice: Number(r.selling_price),
+    currentStock: r.current_stock,
+    reorderLevel: r.reorder_level,
+    unit: r.unit,
+    binLocation: r.bin_location ?? undefined,
+    supplierId: r.supplier_id ?? undefined,
+    supplierName: undefined,
+    active: r.active,
+  };
+}
+
+/** Resolve a product row by legacy id, uuid or SKU → { uuid, row }. Single query. */
+async function resolveProductRow(idOrSku: string): Promise<{ product: InventoryItem; productUuid: string; row: Row } | null> {
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrSku);
+  const { data, error } = await client()!
+    .from('inventory_products')
+    .select('*')
+    .or(isUuid
+      ? `id.eq.${idOrSku},legacy_id.eq.${idOrSku},sku.eq.${idOrSku}`
+      : `legacy_id.eq.${idOrSku},sku.eq.${idOrSku}`)
+    .maybeSingle();
+  if (error || !data) return null;
+  return { product: mapProductRow(data), productUuid: data.id, row: data };
+}
 
 const supabaseRepo: HunterRepository = {
   backend: 'supabase',
@@ -560,6 +622,190 @@ const supabaseRepo: HunterRepository = {
     return (data ?? []).map(mapMovement);
   },
 
+  async getSuppliers() {
+    const { data, error } = await client()!.from('suppliers').select('id, name, contact_person, phone').order('name');
+    if (error) throw error;
+    return (data ?? []).map((s: Row) => ({ id: s.id, name: s.name, contactPerson: s.contact_person ?? undefined, phone: s.phone ?? undefined }));
+  },
+
+  async createProduct(p, actor, actorId) {
+    // SKU uniqueness is enforced by a DB unique constraint; surface it as a
+    // structured error rather than a raw 500.
+    const { data, error } = await client()!
+      .from('inventory_products')
+      .insert({
+        sku: p.sku,
+        part_number: p.partNumber || null,
+        name: p.name,
+        category: p.category,
+        cost_price: p.costPrice,
+        selling_price: p.sellingPrice,
+        current_stock: 0,
+        reorder_level: p.reorderLevel,
+        unit: p.unit || 'Piece',
+        bin_location: p.binLocation || null,
+        supplier_id: p.supplierId || null,
+        active: true,
+      })
+      .select()
+      .single();
+    if (error) {
+      if (error.code === '23505' || /duplicate key|unique/i.test(error.message)) {
+        return { success: false, error: `SKU "${p.sku}" already exists` };
+      }
+      return { success: false, error: 'Could not create the product' };
+    }
+    const opening = p.initialStock ?? 0;
+    if (opening > 0) {
+      // Journaled via hunter_adjust_stock — never a silent stock write.
+      const stock = await this.adjustInventoryStockById(data.id, data.sku, opening, `Opening stock: ${p.name}`, actor, actorId, 'PURCHASE');
+      if (!stock.success) return { success: false, error: stock.error };
+    }
+    await this.logAudit(actor, 'PRODUCT_CREATED', 'InventoryItem', p.sku, `${p.name} (${p.category}), opening stock ${opening}`);
+    return { success: true, item: mapProductRow(data) };
+  },
+
+  /** Journaled stock change addressing the product by uuid or id/SKU (POSTGRES-side actor attribution). */
+  async adjustInventoryStockById(productUuid: string, sku: string, delta: number, reason: string, actor: string, actorId?: string | null, movementType: 'PURCHASE' | 'ADJUSTMENT' | 'RETURN' = 'ADJUSTMENT') {
+    // The API may address the product by uuid, legacy id or SKU with sku='';
+    // resolve to the canonical uuid + sku before touching the database.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(productUuid) || !sku) {
+      const found = await resolveProductRow(productUuid);
+      if (!found) return { success: false as const, error: 'Product not found' };
+      productUuid = found.productUuid;
+      sku = found.product.sku;
+    }
+    if (movementType === 'ADJUSTMENT') {
+      // Existing proven path (row-lock, refuses negative, journals ADJUSTMENT).
+      const { error } = await client()!.rpc('hunter_adjust_stock', {
+        p_product_id: productUuid,
+        p_delta: delta,
+        p_reason: reason,
+        p_actor_id: actorId ?? null,
+      });
+      if (error) {
+        const msg = error.message;
+        if (msg.includes('INSUFFICIENT_STOCK')) {
+          const avail = msg.split(':')[2] ?? '?';
+          return { success: false as const, error: `Insufficient stock. Available: ${avail}, Requested: ${Math.abs(delta)}` };
+        }
+        return { success: false as const, error: 'Stock adjustment failed' };
+      }
+    } else {
+      // PURCHASE / RETURN: prefer the dedicated journaled RPC (migration
+      // 20260914100000). If it is not applied yet, fall back to the proven
+      // hunter_adjust_stock — the movement is still journaled atomically with
+      // the full reason; only the stored movement_type reads ADJUSTMENT.
+      const { error } = await client()!.rpc('hunter_apply_stock', {
+        p_product_id: productUuid,
+        p_delta: delta,
+        p_movement_type: movementType,
+        p_reason: reason,
+        p_actor_id: actorId ?? null,
+      });
+      if (error) {
+        const unavailable = /42883|does not exist|schema cache/i.test(error.message);
+        if (!unavailable) {
+          const msg = error.message;
+          if (msg.includes('INSUFFICIENT_STOCK')) {
+            const avail = msg.split(':')[2] ?? '?';
+            return { success: false as const, error: `Insufficient stock. Available: ${avail}, Requested: ${Math.abs(delta)}` };
+          }
+          return { success: false as const, error: 'Stock operation failed' };
+        }
+        const { error: fallbackError } = await client()!.rpc('hunter_adjust_stock', {
+          p_product_id: productUuid,
+          p_delta: delta,
+          p_reason: reason,
+          p_actor_id: actorId ?? null,
+        });
+        if (fallbackError) {
+          const msg = fallbackError.message;
+          if (msg.includes('INSUFFICIENT_STOCK')) {
+            const avail = msg.split(':')[2] ?? '?';
+            return { success: false as const, error: `Insufficient stock. Available: ${avail}, Requested: ${Math.abs(delta)}` };
+          }
+          return { success: false as const, error: 'Stock operation failed' };
+        }
+      }
+    }
+    const updated = await this.getInventory();
+    return { success: true as const, item: updated.find((p) => p.sku === sku) };
+  },
+
+  async updateProduct(id, p, actor) {
+    const found = await resolveProductRow(id);
+    if (!found) return { success: false, error: 'Product not found' };
+    const { product, productUuid } = found;
+    const { data: before, error } = await client()!.from('inventory_products').select('*').eq('id', productUuid).single();
+    if (error || !before) return { success: false, error: 'Product not found' };
+    const patch: Row = {};
+    if (p.name !== undefined) patch.name = p.name;
+    if (p.sku !== undefined && p.sku !== product.sku) patch.sku = p.sku;
+    if (p.partNumber !== undefined) patch.part_number = p.partNumber || null;
+    if (p.category !== undefined) patch.category = p.category;
+    if (p.costPrice !== undefined) patch.cost_price = p.costPrice;
+    if (p.sellingPrice !== undefined) patch.selling_price = p.sellingPrice;
+    if (p.reorderLevel !== undefined) patch.reorder_level = p.reorderLevel;
+    if (p.unit !== undefined) patch.unit = p.unit;
+    if (p.binLocation !== undefined) patch.bin_location = p.binLocation || null;
+    if (p.supplierId !== undefined) patch.supplier_id = p.supplierId || null;
+    if (p.active !== undefined) patch.active = p.active;
+    if (Object.keys(patch).length === 0) return { success: true, item: product };
+    const { data: after, error: updError } = await client()!
+      .from('inventory_products')
+      .update(patch)
+      .eq('id', productUuid)
+      .select()
+      .single();
+    if (updError) {
+      if (updError.code === '23505' || /duplicate key|unique/i.test(updError.message)) {
+        return { success: false, error: `SKU "${p.sku}" already exists` };
+      }
+      return { success: false, error: 'Could not update the product' };
+    }
+    // Current stock is NOT editable here — quantity changes must be journaled.
+    await this.logAudit(actor, 'PRODUCT_UPDATED', 'InventoryItem', after.sku,
+      `Updated ${Object.keys(patch).join(', ')}`,
+      JSON.stringify({ name: before.name, sku: before.sku, cost_price: before.cost_price, selling_price: before.selling_price, reorder_level: before.reorder_level, active: before.active }),
+      JSON.stringify({ name: after.name, sku: after.sku, cost_price: after.cost_price, selling_price: after.selling_price, reorder_level: after.reorder_level, active: after.active }));
+    return { success: true, item: mapProductRow(after) };
+  },
+
+  async setProductActive(id, active, actor, actorId) {
+    const found = await resolveProductRow(id);
+    if (!found) return { success: false, error: 'Product not found' };
+    const { product, productUuid } = found;
+    const { data: after, error } = await client()!
+      .from('inventory_products')
+      .update({ active })
+      .eq('id', productUuid)
+      .select()
+      .single();
+    if (error) return { success: false, error: 'Could not change product status' };
+    await this.logAudit(actor, active ? 'PRODUCT_ACTIVATED' : 'PRODUCT_DEACTIVATED', 'InventoryItem', product.sku, `${product.name} → ${active ? 'ACTIVE' : 'INACTIVE'}`);
+    return { success: true, item: mapProductRow(after) };
+  },
+
+  async deleteProduct(id, actor) {
+    const found = await resolveProductRow(id);
+    if (!found) return { success: false, error: 'Product not found' };
+    const { product, productUuid } = found;
+    // History protection is database-enforced: inventory_movements,
+    // work_order_parts and pos_sale_items all reference products with
+    // ON DELETE RESTRICT, so a product with any history cannot be deleted —
+    // the FK rejects the delete and we return the archival guidance.
+    const { error } = await client()!.from('inventory_products').delete().eq('id', productUuid);
+    if (error) {
+      if (error.code === '23503' || /foreign key|violates/i.test(error.message)) {
+        return { success: false, error: `${product.name} has stock movements or workshop/POS history and cannot be deleted. Deactivate it instead to preserve history.` };
+      }
+      return { success: false, error: 'Could not delete the product' };
+    }
+    await this.logAudit(actor, 'PRODUCT_DELETED', 'InventoryItem', product.sku, `${product.name} permanently deleted (no history existed)`);
+    return { success: true };
+  },
+
   async adjustInventoryStock(itemId, delta, reason, actor, ref) {
     const products = await this.getInventory();
     const product = products.find((p) => p.id === itemId || p.sku === itemId);
@@ -584,6 +830,9 @@ const supabaseRepo: HunterRepository = {
     const updated = await this.getInventory();
     return { success: true, item: updated.find((p) => p.id === product.id) };
   },
+
+  // NOTE: legacy_id/uuid distinction handled by resolveProduct(); legacy-tagged
+  // products keep their JSON-era ids, new products use uuids directly.
 
   async processPosSale(data) {
     // Resolve cashier uuid from label handled by API layer (passes staff uuid when known)

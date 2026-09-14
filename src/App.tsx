@@ -7,7 +7,8 @@ import {
   StaffMember,
   InventoryItem,
   InventoryMovement,
-  Invoice
+  Invoice,
+  Supplier
 } from './types';
 import { getSupabaseBrowser, fetchStaffIdentity, type StaffAuthUser } from './lib/supabase';
 import { apiFetch } from './lib/api';
@@ -138,6 +139,8 @@ function AppShell() {
   const [bays, setBays] = useState<WorkshopBay[]>([]);
   const [staff, setStaff] = useState<StaffMember[]>([]);
   const [selectedServiceIds, setSelectedServiceIds] = useState<string[]>([]);
+  // Server-side RBAC is the boundary; this only hides buttons the server would 403 anyway.
+  const canWriteInventory = ['OWNER', 'MANAGER', 'INVENTORY_MANAGER'].includes(staffUser?.role ?? '');
 
   const loadStaffData = useCallback(async () => {
     // Every call carries the Bearer token; server enforces RBAC per family.
@@ -160,10 +163,13 @@ function AppShell() {
   useEffect(() => {
     if (staffUser) {
       loadStaffData();
+      apiFetch<{ success: boolean; data: Supplier[] }>('/api/v1/inventory/suppliers')
+        .then(({ data }) => { if (data?.success) setSuppliers(data.data); })
+        .catch(() => { /* supplier list is non-critical; form shows — None — */ });
     } else {
       // Purge internal data from memory when signed out
       setWorkOrders([]); setInventory([]); setMovements([]);
-      setInvoices([]); setBays([]); setStaff([]);
+      setInvoices([]); setBays([]); setStaff([]); setSuppliers([]);
     }
   }, [staffUser, loadStaffData]);
 
@@ -207,6 +213,47 @@ function AppShell() {
       setInventory(prev => prev.map(i => i.id === itemId ? data.data : i));
     }
     return data;
+  };
+
+  // ---- Inventory product management (server enforces Owner/write boundaries) ----
+  const [suppliers, setSuppliers] = useState<Supplier[]>([]);
+
+  const handleCreateProduct = async (p: Record<string, unknown>) => {
+    const { data } = await apiFetch<{ success: boolean; error?: string }>('/api/v1/inventory/products', {
+      method: 'POST',
+      body: JSON.stringify(p),
+    });
+    return { success: Boolean(data?.success), error: data?.error };
+  };
+
+  const handleUpdateProduct = async (id: string, p: Record<string, unknown>) => {
+    const { data } = await apiFetch<{ success: boolean; error?: string }>(`/api/v1/inventory/products/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(p),
+    });
+    return { success: Boolean(data?.success), error: data?.error };
+  };
+
+  const handleSetProductActive = async (id: string, active: boolean) => {
+    const { data } = await apiFetch<{ success: boolean; error?: string }>(`/api/v1/inventory/products/${encodeURIComponent(id)}/${active ? 'activate' : 'deactivate'}`, {
+      method: 'POST',
+    });
+    return { success: Boolean(data?.success), error: data?.error };
+  };
+
+  const handleDeleteProduct = async (id: string) => {
+    const { data } = await apiFetch<{ success: boolean; error?: string }>(`/api/v1/inventory/products/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    return { success: Boolean(data?.success), error: data?.error };
+  };
+
+  const handleStockMovement = async (id: string, delta: number, kind: 'PURCHASE' | 'ADJUSTMENT' | 'RETURN', reason: string) => {
+    const { data } = await apiFetch<{ success: boolean; error?: string }>('/api/v1/inventory/movement', {
+      method: 'POST',
+      body: JSON.stringify({ itemId: id, delta, kind, reason }),
+    });
+    return { success: Boolean(data?.success), error: data?.error };
   };
 
   const handlePosCheckout = async (saleData: unknown) => {
@@ -299,7 +346,16 @@ function AppShell() {
           <InventoryView
             inventory={inventory}
             movements={movements}
+            canWrite={canWriteInventory}
+            canDelete={staffUser?.role === 'OWNER'}
+            suppliers={suppliers}
+            onCreateProduct={handleCreateProduct}
+            onUpdateProduct={handleUpdateProduct}
+            onSetProductActive={handleSetProductActive}
+            onDeleteProduct={handleDeleteProduct}
+            onStockMovement={handleStockMovement}
             onAdjustStock={handleAdjustStock}
+            onRefresh={loadStaffData}
           />
         )}
 

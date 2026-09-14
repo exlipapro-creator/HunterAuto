@@ -433,6 +433,213 @@ apiRouter.post('/inventory/adjust', requireAuth('inventory'), async (req: Authed
   res.json({ success: true, data: result.item });
 });
 
+// ---- Inventory product management (Owner: full; Manager/Inventory Manager:
+// ---- operational. Server-side RBAC below; UI hiding is not the boundary.)
+
+const PRODUCT_CATEGORIES = ['OILS_FLUIDS', 'FILTERS', 'BRAKES', 'SUSPENSION', 'TYRES', 'ELECTRICAL', 'ACCESSORIES', 'CAR_CARE'] as const;
+
+/** Owner-only inventory administration (hard delete). */
+function requireOwner(req: AuthedRequest, res: Response): boolean {
+  if (req.actor?.role !== 'OWNER') {
+    res.status(403).json({ success: false, error: 'Owner permission required' });
+    return false;
+  }
+  return true;
+}
+
+/** Resolve the staff uuid for movement attribution (never client-controlled). */
+async function actorStaffUuid(req: AuthedRequest): Promise<string | null> {
+  if (!req.actor) return null;
+  const { getSupabaseAdmin } = await import('./lib/supabaseAdmin.js');
+  const admin = getSupabaseAdmin();
+  if (!admin) return null;
+  const { data } = await admin.from('staff').select('id').eq('auth_user_id', req.actor.userId).maybeSingle();
+  return (data?.id as string) ?? null;
+}
+
+interface ParsedProductBody {
+  name: string; sku: string; category: string;
+  costPrice: number; sellingPrice: number; reorderLevel: number;
+  partNumber?: string; unit?: string; binLocation?: string;
+  supplierId?: string; initialStock?: number; active?: boolean;
+}
+
+/** Strict product-field validation — TZS minor units as integers, never floats. */
+interface ParseResult { ok: boolean; value?: Partial<ParsedProductBody>; error?: string }
+function parseProductBody(body: any, opts: { requireAll: boolean }): ParseResult {
+  const out: Partial<ParsedProductBody> = {};
+  if (body.name !== undefined || opts.requireAll) {
+    const name = String(body.name ?? '').trim();
+    if (name.length < 2 || name.length > 120) return { ok: false, error: 'Product name must be 2–120 characters' };
+    out.name = name;
+  }
+  if (body.sku !== undefined || opts.requireAll) {
+    const sku = String(body.sku ?? '').trim().toUpperCase();
+    if (!/^[A-Z0-9][A-Z0-9\-]{1,31}$/.test(sku)) return { ok: false, error: 'SKU must be 2–32 characters (letters, numbers, dashes)' };
+    out.sku = sku;
+  }
+  if (body.category !== undefined || opts.requireAll) {
+    const cat = String(body.category ?? '').trim().toUpperCase();
+    if (!(PRODUCT_CATEGORIES as readonly string[]).includes(cat)) return { ok: false, error: 'Invalid category' };
+    out.category = cat;
+  }
+  for (const field of ['costPrice', 'sellingPrice'] as const) {
+    if (body[field] !== undefined || opts.requireAll) {
+      const v = Number(body[field]);
+      if (!Number.isInteger(v) || v < 0 || v > 1_000_000_000) return { ok: false, error: `${field === 'costPrice' ? 'Cost price' : 'Retail price'} must be a whole TZS amount ≥ 0` };
+      out[field] = v;
+    }
+  }
+  if (body.reorderLevel !== undefined || opts.requireAll) {
+    const v = Number(body.reorderLevel ?? 0);
+    if (!Number.isInteger(v) || v < 0 || v > 1_000_000) return { ok: false, error: 'Reorder level must be a whole number ≥ 0' };
+    out.reorderLevel = v;
+  }
+  if (body.initialStock !== undefined) {
+    const v = Number(body.initialStock);
+    if (!Number.isInteger(v) || v < 0 || v > 100_000) return { ok: false, error: 'Initial stock must be a whole number ≥ 0' };
+    out.initialStock = v;
+  }
+  for (const [field, max] of [['partNumber', 64], ['unit', 24], ['binLocation', 64]] as const) {
+    if (body[field] !== undefined) {
+      const v = String(body[field] ?? '').trim();
+      if (v.length > max) return { ok: false, error: `${field} too long` };
+      out[field] = v || undefined;
+    }
+  }
+  if (body.supplierId !== undefined) {
+    const v = String(body.supplierId ?? '').trim();
+    if (v && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return { ok: false, error: 'Invalid supplier' };
+    out.supplierId = v || undefined;
+  }
+  if (body.active !== undefined) {
+    if (typeof body.active !== 'boolean') return { ok: false, error: 'active must be true or false' };
+    out.active = body.active;
+  }
+  return { ok: true, value: out, error: undefined };
+}
+
+apiRouter.get('/inventory/suppliers', requireAuth('inventory'), async (_req: AuthedRequest, res: Response) => {
+  try {
+    res.json({ success: true, data: await repo.getSuppliers() });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not load suppliers' });
+  }
+});
+
+apiRouter.get('/inventory/products/:id/movements', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  try {
+    const id = String(req.params.id || '').slice(0, 64);
+    const all = await repo.getInventoryMovements();
+    // Movement rows carry the resolved SKU; match by product id or SKU.
+    const item = (await repo.getInventory()).find((p) => p.id === id || p.sku === id);
+    if (!item) return res.status(404).json({ success: false, error: 'Product not found' });
+    const productMovements = all.filter((m) => m.inventoryItemId === item.id || m.sku === item.sku);
+    res.json({ success: true, data: productMovements });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not load movement history' });
+  }
+});
+
+apiRouter.post('/inventory/products', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  // Write access already restricted by requireAuth to OWNER/MANAGER/INVENTORY_MANAGER.
+  const parsed = parseProductBody(req.body || {}, { requireAll: true });
+  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error });
+  try {
+    const result = await repo.createProduct(parsed.value, actorLabel(req.actor), await actorStaffUuid(req));
+    if (!result.success) return res.status(400).json({ success: false, error: result.error });
+    res.status(201).json({ success: true, data: result.item });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not create the product' });
+  }
+});
+
+apiRouter.patch('/inventory/products/:id', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  const parsed = parseProductBody(req.body || {}, { requireAll: false });
+  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error });
+  if (!parsed.value || Object.keys(parsed.value).length === 0) return res.status(400).json({ success: false, error: 'No editable fields supplied' });
+  if (parsed.value.initialStock !== undefined) delete parsed.value.initialStock; // never editable via PATCH
+  if (parsed.value.active === false) delete parsed.value.active; // deactivation is its own audited endpoint
+  try {
+    const result = await repo.updateProduct(String(req.params.id || '').slice(0, 64), parsed.value, actorLabel(req.actor));
+    if (!result.success) return res.status(result.error === 'Product not found' ? 404 : 400).json({ success: false, error: result.error });
+    res.json({ success: true, data: result.item });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not update the product' });
+  }
+});
+
+apiRouter.post('/inventory/products/:id/deactivate', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  // Operational action (family write roles); hard delete below is Owner-only.
+  try {
+    const result = await repo.setProductActive(String(req.params.id || '').slice(0, 64), false, actorLabel(req.actor), await actorStaffUuid(req));
+    if (!result.success) return res.status(result.error === 'Product not found' ? 404 : 400).json({ success: false, error: result.error });
+    res.json({ success: true, data: result.item });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not deactivate the product' });
+  }
+});
+
+apiRouter.post('/inventory/products/:id/activate', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  try {
+    const result = await repo.setProductActive(String(req.params.id || '').slice(0, 64), true, actorLabel(req.actor), await actorStaffUuid(req));
+    if (!result.success) return res.status(result.error === 'Product not found' ? 404 : 400).json({ success: false, error: result.error });
+    res.json({ success: true, data: result.item });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not activate the product' });
+  }
+});
+
+// Journaled stock movement with an explicit movement kind (PURCHASE / RETURN /
+// ADJUSTMENT). Distinct from the legacy /inventory/adjust endpoint, which stays
+// for compatibility and always journals as ADJUSTMENT.
+apiRouter.post('/inventory/movement', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  const { itemId, delta, kind, reason } = req.body || {};
+  if (!itemId || delta === undefined || !kind || !reason) {
+    return res.status(400).json({ success: false, error: 'Missing required movement fields' });
+  }
+  const amount = typeof delta === 'number' ? delta : parseInt(String(delta), 10);
+  if (!Number.isInteger(amount) || amount === 0) {
+    return res.status(400).json({ success: false, error: 'Quantity must be a non-zero whole number' });
+  }
+  if (Math.abs(amount) > 100_000) {
+    return res.status(400).json({ success: false, error: 'Quantity change out of range' });
+  }
+  const movementKind = String(kind).toUpperCase();
+  if (!['PURCHASE', 'RETURN', 'ADJUSTMENT'].includes(movementKind)) {
+    return res.status(400).json({ success: false, error: 'Invalid movement type' });
+  }
+  if (movementKind === 'PURCHASE' && amount < 0) {
+    return res.status(400).json({ success: false, error: 'Use RETURN for stock reductions back to a supplier' });
+  }
+  try {
+    const result = await repo.adjustInventoryStockById(
+      String(itemId),
+      '', // sku is re-resolved inside the repository
+      amount,
+      String(reason).slice(0, 300),
+      actorLabel(req.actor),
+      await actorStaffUuid(req),
+      movementKind as 'PURCHASE' | 'ADJUSTMENT' | 'RETURN'
+    );
+    if (!result.success) return res.status(400).json({ success: false, error: result.error });
+    res.json({ success: true, data: result.item });
+  } catch {
+    res.status(500).json({ success: false, error: 'Stock movement failed' });
+  }
+});
+
+apiRouter.delete('/inventory/products/:id', requireAuth('inventory'), async (req: AuthedRequest, res: Response) => {
+  if (!requireOwner(req, res)) return;
+  try {
+    const result = await repo.deleteProduct(String(req.params.id || '').slice(0, 64), actorLabel(req.actor));
+    if (!result.success) return res.status(result.error === 'Product not found' ? 404 : 400).json({ success: false, error: result.error });
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ success: false, error: 'Could not delete the product' });
+  }
+});
+
 // ============================================================
 // STAFF: point of sale
 // ============================================================
