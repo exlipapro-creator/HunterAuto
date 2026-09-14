@@ -923,6 +923,9 @@ const supabaseRepo: HunterRepository = {
         quantity: i.quantity,
         unitPrice: Number(i.unit_price),
         total: Number(i.line_total),
+        // Invoice documents render the totalPrice display alias; it must always
+        // carry the authoritative line_total so money never reads undefined.
+        totalPrice: Number(i.line_total),
       })),
       subtotal: Number(r.subtotal),
       discount: Number(r.discount),

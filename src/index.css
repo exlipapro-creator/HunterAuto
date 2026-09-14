@@ -58,3 +58,65 @@
   background-image: radial-gradient(rgba(21, 158, 243, 0.15) 1px, transparent 1px);
   background-size: 24px 24px;
 }
+
+/* ============================================================
+   INVOICE DOCUMENT — PRINT / PDF (business-document quality)
+   Screen: white document inside the dark staff shell.
+   Print (Print A4 button → body.printing-invoice, or Ctrl+P on
+   the invoice route): ONLY the invoice document, A4-clean.
+   ============================================================ */
+@media print {
+  @page {
+    size: A4;
+    margin: 12mm;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+  }
+
+  /* Keep the navy header row, brand blues, and status tints on paper. */
+  .invoice-document,
+  .invoice-document * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Hide everything, then reveal only the invoice document.
+     The :has() guard keeps other pages' Ctrl+P behavior unchanged. */
+  body.printing-invoice *,
+  body:not(.printing-invoice) #root:has(#official-hunter-invoice) * {
+    visibility: hidden;
+  }
+
+  body.printing-invoice #official-hunter-invoice,
+  body:not(.printing-invoice) #root:has(#official-hunter-invoice) #official-hunter-invoice {
+    visibility: visible;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    max-width: none;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+  }
+
+  body.printing-invoice #official-hunter-invoice *,
+  body:not(.printing-invoice) #root:has(#official-hunter-invoice) #official-hunter-invoice * {
+    visibility: visible;
+  }
+
+  /* Table headers repeat if a long invoice spans pages. */
+  #official-hunter-invoice thead {
+    display: table-header-group;
+  }
+
+  #official-hunter-invoice tr,
+  #official-hunter-invoice footer,
+  #official-hunter-invoice header {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}

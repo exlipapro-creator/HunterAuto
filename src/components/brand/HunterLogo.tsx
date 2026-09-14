@@ -2,7 +2,7 @@ import React from 'react';
 import canonicalLogo from '../../assets/brand/hunter-autoworks-logo.jpg';
 
 interface HunterLogoProps {
-  variant?: 'full' | 'compact' | 'mark';
+  variant?: 'full' | 'compact' | 'mark' | 'document';
   className?: string;
 }
 
@@ -19,14 +19,17 @@ interface HunterLogoProps {
 export const HunterLogo: React.FC<HunterLogoProps> = ({ variant = 'full', className = '' }) => {
   // Size map per variant — proportions of the circular artwork are preserved.
   const sizeClass =
-    variant === 'mark' ? 'w-9 h-9' : variant === 'compact' ? 'w-8 h-8' : 'w-10 h-10';
+    variant === 'mark' ? 'w-9 h-9'
+    : variant === 'compact' ? 'w-8 h-8'
+    : variant === 'document' ? 'w-16 h-16'
+    : 'w-10 h-10';
 
   return (
     <img
       src={canonicalLogo}
       alt="Hunter Autoworks — The Car Lab"
-      width={variant === 'mark' ? 36 : variant === 'compact' ? 32 : 40}
-      height={variant === 'mark' ? 36 : variant === 'compact' ? 32 : 40}
+      width={variant === 'mark' ? 36 : variant === 'compact' ? 32 : variant === 'document' ? 64 : 40}
+      height={variant === 'mark' ? 36 : variant === 'compact' ? 32 : variant === 'document' ? 64 : 40}
       className={`${sizeClass} rounded-full object-cover select-none ${className}`}
       draggable={false}
       id="hunter-logo-img"
