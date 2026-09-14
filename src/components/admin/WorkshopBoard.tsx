@@ -68,14 +68,15 @@ export const WorkshopBoard: React.FC<WorkshopBoardProps> = ({
           </div>
         </div>
 
-        {/* Filters */}
-        <div className="flex flex-wrap items-center gap-2 text-xs font-mono-telemetry">
-          <div className="flex items-center gap-1 bg-[#000000] border border-[#132038] px-2.5 py-1.5 rounded">
+        {/* Filters — min-w-0 lets the wraps shrink below the selects'
+            intrinsic option width so controls never escape the board frame */}
+        <div className="flex flex-wrap items-center gap-2 text-xs font-mono-telemetry min-w-0 max-w-full">
+          <div className="flex items-center gap-1 bg-[#000000] border border-[#132038] px-2.5 py-1.5 rounded min-w-0 max-w-full">
             <span className="text-[#8E9BAE]">Bay:</span>
             <select
               value={selectedBayFilter}
               onChange={(e) => setSelectedBayFilter(e.target.value)}
-              className="bg-transparent text-white focus:outline-none cursor-pointer"
+              className="bg-transparent text-white focus:outline-none cursor-pointer min-w-0 flex-1"
               id="board-filter-bay"
             >
               <option value="ALL">All Bays</option>
@@ -87,12 +88,12 @@ export const WorkshopBoard: React.FC<WorkshopBoardProps> = ({
             </select>
           </div>
 
-          <div className="flex items-center gap-1 bg-[#000000] border border-[#132038] px-2.5 py-1.5 rounded">
+          <div className="flex items-center gap-1 bg-[#000000] border border-[#132038] px-2.5 py-1.5 rounded min-w-0 max-w-full">
             <span className="text-[#8E9BAE]">Priority:</span>
             <select
               value={selectedPriorityFilter}
               onChange={(e) => setSelectedPriorityFilter(e.target.value)}
-              className="bg-transparent text-white focus:outline-none cursor-pointer"
+              className="bg-transparent text-white focus:outline-none cursor-pointer min-w-0 flex-1"
               id="board-filter-priority"
             >
               <option value="ALL">All</option>
@@ -182,14 +183,14 @@ export const WorkshopBoard: React.FC<WorkshopBoardProps> = ({
 
                           {/* Bay & Tech Assignments */}
                           <div className="pt-2.5 border-t border-[#132038] space-y-1.5 text-[11px] font-mono-telemetry">
-                            <div className="flex items-center justify-between text-slate-400">
-                              <span className="text-[#8E9BAE]">Bay:</span>
+                            <div className="flex items-center justify-between gap-2 min-w-0 text-slate-400">
+                              <span className="text-[#8E9BAE] shrink-0">Bay:</span>
                               <select
                                 value={wo.assignedBayId || ''}
                                 onChange={(e) =>
                                   onAssignBayTech(wo.id, e.target.value, wo.assignedTechnicianId || '')
                                 }
-                                className="bg-[#00101F] text-slate-200 border border-[#132038] rounded px-1.5 py-0.5 text-[11px] focus:outline-none"
+                                className="bg-[#00101F] text-slate-200 border border-[#132038] rounded px-1.5 py-0.5 text-[11px] focus:outline-none min-w-0 flex-1 max-w-full"
                               >
                                 <option value="">Unassigned</option>
                                 {bays.map((b) => (
@@ -200,14 +201,14 @@ export const WorkshopBoard: React.FC<WorkshopBoardProps> = ({
                               </select>
                             </div>
 
-                            <div className="flex items-center justify-between text-slate-400">
-                              <span className="text-[#8E9BAE]">Tech:</span>
+                            <div className="flex items-center justify-between gap-2 min-w-0 text-slate-400">
+                              <span className="text-[#8E9BAE] shrink-0">Tech:</span>
                               <select
                                 value={wo.assignedTechnicianId || ''}
                                 onChange={(e) =>
                                   onAssignBayTech(wo.id, wo.assignedBayId || '', e.target.value)
                                 }
-                                className="bg-[#00101F] text-slate-200 border border-[#132038] rounded px-1.5 py-0.5 text-[11px] focus:outline-none"
+                                className="bg-[#00101F] text-slate-200 border border-[#132038] rounded px-1.5 py-0.5 text-[11px] focus:outline-none min-w-0 flex-1 max-w-full"
                               >
                                 <option value="">Unassigned</option>
                                 {technicians.map((t) => (
