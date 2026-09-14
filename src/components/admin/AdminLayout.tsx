@@ -96,12 +96,26 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
     };
   }, [updateScrollState]);
 
-  // Active route auto-scrolls into view (block:'nearest' avoids page jumps).
+  // Active route auto-scrolls into view. Browser-authoritative approach:
+  // the click's native focus-reveal honors scroll-margin on the tabs (see
+  // className below); this effect only backfills for programmatic tab
+  // changes after the reveal has settled, using scrollIntoView so the
+  // BROWSER — not component math — computes the alignment.
   useEffect(() => {
-    const el = navScrollRef.current;
-    if (!el) return;
-    const btn = el.querySelector(`#control-tab-${CSS.escape(currentTab)}`);
-    btn?.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'smooth' });
+    // Runs after Chromium's post-click focus-reveal (which fires in a later
+    // task than rAF and only guarantees left-edge visibility); this corrects
+    // any remaining clip with a spec-compliant full-visibility scroll.
+    const t = setTimeout(() => {
+      const el = navScrollRef.current;
+      if (!el) return;
+      const btn = el.querySelector<HTMLElement>(`#control-tab-${CSS.escape(currentTab)}`);
+      if (!btn) return;
+      const elRect = el.getBoundingClientRect();
+      const bRect = btn.getBoundingClientRect();
+      const clipped = bRect.left < elRect.left || bRect.right > elRect.right;
+      if (clipped) btn.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'auto' });
+    }, 60);
+    return () => { clearTimeout(t); };
   }, [currentTab, visibleNav.length]);
 
   const scrollNav = (dir: -1 | 1) => {
@@ -170,7 +184,7 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
               <ChevronLeft className="w-4 h-4" />
             </button>
           )}
-          <div ref={navScrollRef} className="overflow-x-auto scrollbar-none flex-1 min-w-0">
+          <div id="nav-tab-scroll" ref={navScrollRef} className="overflow-x-auto scrollbar-none flex-1 min-w-0">
             <nav className="flex items-center gap-1.5 py-2 min-w-max" aria-label="Staff sections">
           {visibleNav.map((item) => {
             const Icon = item.icon;
@@ -180,7 +194,7 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
               <button
                 key={item.id}
                 onClick={() => setCurrentTab(item.id)}
-                className={`flex items-center gap-2 px-3 py-2 rounded text-xs font-mono-telemetry uppercase transition-all ${
+                className={`flex items-center gap-2 px-3 py-2 rounded text-xs font-mono-telemetry uppercase transition-all [scroll-margin-left:8px] [scroll-margin-right:8px] ${
                   isActive
                     ? 'bg-[#159EF3] text-black font-bold shadow-[0_0_12px_rgba(21,158,243,0.3)]'
                     : 'text-slate-300 hover:text-white hover:bg-slate-900 border border-transparent'
