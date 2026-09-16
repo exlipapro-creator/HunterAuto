@@ -1,0 +1,270 @@
+# PHASE 3B.1 — CI prebuilt production OSRM image publication (manual dispatch only).
+#
+# Purpose: build the EXISTING osrm/Dockerfile (Tanzania graph baked in at build
+# time) into an immutable, pullable GHCR image that Render's hunter-osrm
+# private service can pull — because the measured preprocessing peak
+# (4.68 GB, GitHub Actions run 35092600418) exceeds Render Standard build RAM.
+#
+# VERIFY vs PUBLISH: verification remains .github/workflows/verify-osrm.yml
+# (proves the toolchain); this workflow creates the production ARTIFACT from
+# the same Dockerfile, version, profile, and runtime flags. Compatibility is
+# enforced at run time by the pre-flight pin check below.
+#
+# Safety: workflow_dispatch only; push happens ONLY after every build, content,
+# and runtime gate passes; the pushed artifact is then pulled back BY DIGEST
+# and re-verified. No `latest`, no mutable production tag. Secrets: only the
+# workflow's own GITHUB_TOKEN (permissions: packages: write, contents: read).
+
+name: publish-osrm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-osrm
+  cancel-in-progress: false
+
+jobs:
+  publish-hunter-osrm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: "A. Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Env facts + determinism inputs"
+        run: |
+          df -h / | tail -1 | tee disk-evidence.txt
+          echo "SOURCE_COMMIT=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "SOURCE_REF=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/hunter-osrm" >> "$GITHUB_ENV"
+
+      - name: "Pre-flight: Dockerfile pin must be the certified toolchain (no floating base)"
+        run: |
+          PIN=$(grep -m1 '^FROM osrm/osrm-backend:' osrm/Dockerfile | awk '{print $2}')
+          N=$(grep -c '^FROM osrm/osrm-backend:' osrm/Dockerfile)
+          echo "pinned base: $PIN (stages: $N)"
+          [ "$N" = "2" ] || { echo '::error::Dockerfile stage count changed — review before publishing'; exit 1; }
+          if echo "$PIN" | grep -q ':latest'; then echo '::error::floating base tag forbidden'; exit 1; fi
+          case "$PIN" in osrm/osrm-backend:v5.25.0) ;; *) echo '::error::base pin differs from Phase 3A certified v5.25.0 — conscious review required'; exit 1;; esac
+          grep -q '/opt/car.lua' osrm/Dockerfile || { echo '::error::car profile path missing'; exit 1; }
+          grep -q -- '--algorithm mld' osrm/Dockerfile || { echo '::error::MLD runtime flag missing'; exit 1; }
+          OSRM_PIN="${PIN#osrm/osrm-backend:}"
+          TAG="v5.25.0-tanzania-${GITHUB_SHA::7}"
+          echo "OSRM_PIN=${OSRM_PIN}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "IMAGE_REF=${IMAGE_NAME:-}/${TAG}"
+          echo "image will be tagged: ${IMAGE_NAME}:${TAG}"
+
+      - name: "Build the production image (existing osrm/Dockerfile — graph baked in)"
+        run: |
+          START=$(date +%s)
+          docker build --progress=plain -f osrm/Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" osrm/ > build-full.log 2>&1 \
+            || { echo '::error::docker build failed'; tail -60 build-full.log; exit 1; }
+          END=$(date +%s)
+          echo "BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          tail -c 200000 build-full.log > build.log
+          grep -E "^#[0-9]+ (DONE|ERROR)" build-full.log | tail -25 || true
+          docker image ls "${IMAGE_NAME}" --format 'built: {{.Repository}}:{{.Tag}} {{.Size}}'
+          df -h / | tail -1 >> disk-evidence.txt
+
+      - name: "Image inspect (identity + port + entrypoint)"
+        run: |
+          docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" > image-inspect-local.json
+          node -e '
+            const i = require("./image-inspect-local.json")[0];
+            const okArch = i.Architecture === "amd64" && i.Os === "linux";
+            const okPort = !!(i.Config.ExposedPorts && i.Config.ExposedPorts["5000/tcp"]);
+            const okEp = Array.isArray(i.Config.Entrypoint) && i.Config.Entrypoint.length > 0;
+            console.log(`id=${i.Id} size=${(i.Size/1073741824).toFixed(2)}GiB arch=${i.Architecture}/${i.Os} port5000=${okPort} entrypoint=${okEp}`);
+            if (!okArch || !okPort || !okEp) process.exit(1);
+          '
+          ID=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{.Id}}')
+          SIZE_MB=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{.Size}}' | awk '{printf "%d", $1/1048576}')
+          echo "IMAGE_ID=${ID}" >> "$GITHUB_ENV"
+          echo "SIZE_MB=${SIZE_MB}" >> "$GITHUB_ENV"
+
+      - name: "OSRM version verified INSIDE the image"
+        run: |
+          docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" osrm-extract --version 2>&1 | head -1 | tee osrm-version.txt
+          grep -q "${OSRM_PIN}" osrm-version.txt || { echo '::error::in-image OSRM version does not match the Dockerfile pin'; exit 1; }
+
+      - name: "Graph content verification inside the final runtime image"
+        run: |
+          # §11: filesystem proof, not size/exit-code inference. The prepared
+          # graph must be present and the source PBF must be GONE (graph-only image).
+          docker run --rm --entrypoint sh "${IMAGE_NAME}:${IMAGE_TAG}" -c '
+            ls -lh /data | tee /tmp/ls.txt
+            for f in tanzania-latest.osrm tanzania-latest.osrm.edges tanzania-latest.osrm.geometry \
+                     tanzania-latest.osrm.nodes tanzania-latest.osrm.properties tanzania-latest.osrm.cell_metrics; do
+              test -s "/data/$f" || { echo "MISSING graph artifact: $f"; exit 1; }
+            done
+            test ! -f /data/tanzania-latest.osm.pbf || { echo "source PBF must not ship in the runtime image"; exit 1; }
+            du -sm /data
+          ' | tee graph-content.txt
+          GRAPH_MB=$(grep -oE '^[0-9]+\s+/data$' graph-content.txt | awk '{print $1}')
+          echo "GRAPH_MB=${GRAPH_MB:-0}" >> "$GITHUB_ENV"
+
+      - name: "Runtime smoke: start the built image exactly as production will"
+        run: |
+          # Uses the image's OWN entrypoint (osrm-routed --algorithm mld
+          # --max-table-size 100 --port ${PORT:-5000}) — the real runtime path.
+          docker run -d --name hunter-osrm-publish --network host -e PORT=5000 "${IMAGE_NAME}:${IMAGE_TAG}"
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
+            if [ "$code" = "200" ]; then echo "image OSRM ready after ~$((i * 2))s"; exit 0; fi
+            running=$(docker inspect -f '{{.State.Running}}' hunter-osrm-publish 2>/dev/null || echo 'false')
+            if [ "$running" != 'true' ]; then
+              echo '::error::built image container exited during startup (graph load failure)'
+              docker logs --tail 40 hunter-osrm-publish 2>&1 | tee routed-publish.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo '::error::built image OSRM never became ready (180s)'
+          docker logs --tail 40 hunter-osrm-publish 2>&1 | tee routed-publish.log || true
+          exit 1
+
+      - name: "REAL Tanzania route against the built image"
+        run: |
+          curl -sf --max-time 20 \
+            'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
+            -o route-response.json
+          node -e '
+            const r = require("./route-response.json");
+            const rt = r.routes?.[0];
+            if (r.code !== "Ok" || !rt) { console.error("no route:", r.code); process.exit(1); }
+            const okD = typeof rt.distance === "number" && rt.distance > 0 && Number.isFinite(rt.distance);
+            const okT = typeof rt.duration === "number" && rt.duration > 0 && Number.isFinite(rt.duration);
+            const okG = Array.isArray(rt.geometry?.coordinates) && rt.geometry.coordinates.length >= 2;
+            console.log(`distance=${rt.distance}m duration=${rt.duration}s points=${rt.geometry.coordinates.length}`);
+            if (!okD || !okT || !okG) { console.error("route validation failed"); process.exit(1); }
+            const last = rt.geometry.coordinates.at(-1);
+            if (Math.abs(last[1] - (-6.7789875)) > 0.0005 || Math.abs(last[0] - 39.265234375) > 0.0005) { console.error("route does not end at Hunter destination"); process.exit(1); }
+            const bad = rt.geometry.coordinates.filter(([lng, lat]) => !(lng > 29.0 && lng < 41.0 && lat > -12 && lat < -0.8));
+            if (bad.length) { console.error("geometry outside Tanzania bbox:", bad.length); process.exit(1); }
+            console.log("built-image route: PASS (ends at Hunter, inside Tanzania)");
+          '
+
+      - name: "RSS observation + stop built-image container"
+        if: always()
+        run: |
+          if docker inspect -f '{{.State.Running}}' hunter-osrm-publish 2>/dev/null | grep -q true; then
+            USAGE=$(docker stats --no-stream --format '{{.MemUsage}}' hunter-osrm-publish)
+            echo "built-image osrm-routed memory: $USAGE" | tee rss-evidence.txt
+            NUM=$(echo "$USAGE" | awk '{print $1}' | tr -d ' GiB')
+            UNIT=$(echo "$USAGE" | awk '{print $1}' | grep -o 'GiB\|MiB' || echo 'MiB')
+            case "$UNIT" in GiB) MB=$(awk "BEGIN{printf \"%d\", $NUM * 1024}") ;; *) MB=$(awk "BEGIN{printf \"%d\", $NUM}") ;; esac
+            echo "ROUTED_RSS_MB=${MB}" >> "$GITHUB_ENV"
+          fi
+          docker rm -f hunter-osrm-publish 2>/dev/null || true
+
+      - name: "Push the exact immutable tag (GHCR, native GITHUB_TOKEN)"
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE_NAME}:${IMAGE_TAG}" 2>&1 | tee push.log
+          DIGEST=$(grep -oE 'digest: sha256:[a-f0-9]+' push.log | awk '{print $2}' | head -1)
+          [ -n "$DIGEST" ] || { echo '::error::push produced no digest'; exit 1; }
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+          echo "published: ${IMAGE_NAME}:${IMAGE_TAG}@${DIGEST}"
+
+      - name: "Registry verification: remove local image, pull back BY DIGEST"
+        run: |
+          docker rmi "${IMAGE_NAME}:${IMAGE_TAG}" || true
+          docker pull "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          docker image inspect "${IMAGE_NAME}@${IMAGE_DIGEST}" > image-inspect-pulled.json
+          echo "pulled-by-digest: $(docker image inspect "${IMAGE_NAME}@${IMAGE_DIGEST}" --format '{{.Id}}')"
+
+      - name: "Pulled image passes the SAME graph + runtime + route gates"
+        run: |
+          # §21: the artifact Render will pull is itself production-verified.
+          docker run --rm --entrypoint sh "${IMAGE_NAME}@${IMAGE_DIGEST}" -c '
+            test -s /data/tanzania-latest.osrm || { echo "graph missing in pulled image"; exit 1; }
+            test -s /data/tanzania-latest.osrm.edges || { echo "edges missing in pulled image"; exit 1; }
+            echo "pulled-image graph content: PASS"
+          ' | tee graph-content-pulled.txt
+          docker run -d --name hunter-osrm-pulled --network host -e PORT=5000 "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
+            if [ "$code" = "200" ]; then echo "pulled image OSRM ready after ~$((i * 2))s"; break; fi
+            running=$(docker inspect -f '{{.State.Running}}' hunter-osrm-pulled 2>/dev/null || echo 'false')
+            if [ "$running" != 'true' ]; then
+              echo '::error::PULLED image container exited during startup'
+              docker logs --tail 40 hunter-osrm-pulled 2>&1 | tee routed-pulled.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+          [ "$code" = "200" ] || { echo '::error::pulled image never became ready'; docker logs --tail 40 hunter-osrm-pulled 2>&1 | tee routed-pulled.log; exit 1; }
+          curl -sf --max-time 20 \
+            'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
+            -o route-response-pulled.json
+          node -e '
+            const r = require("./route-response-pulled.json");
+            const rt = r.routes?.[0];
+            if (r.code !== "Ok" || !rt || !(rt.distance > 0) || !(rt.duration > 0) || !(rt.geometry?.coordinates?.length >= 2)) { console.error("pulled-image route invalid"); process.exit(1); }
+            const last = rt.geometry.coordinates.at(-1);
+            if (Math.abs(last[1] - (-6.7789875)) > 0.0005 || Math.abs(last[0] - 39.265234375) > 0.0005) { console.error("pulled-image route does not end at Hunter"); process.exit(1); }
+            console.log(`pulled-image route: PASS distance=${rt.distance}m duration=${rt.duration}s`);
+          '
+          docker rm -f hunter-osrm-pulled 2>/dev/null || true
+
+      - name: "Publication report"
+        if: always()
+        run: |
+          cat > publish-report.json <<EOF
+          {
+            "date": "$(date -u +%FT%TZ)",
+            "source_commit": "${SOURCE_COMMIT:-unknown}",
+            "source_ref": "${SOURCE_REF:-unknown}",
+            "registry": "ghcr.io",
+            "image": "${IMAGE_NAME:-unknown}",
+            "image_tag": "${IMAGE_TAG:-unknown}",
+            "image_digest": "${IMAGE_DIGEST:-not_pushed}",
+            "image_id": "${IMAGE_ID:-unknown}",
+            "size_mb": ${SIZE_MB:-null},
+            "graph_mb": ${GRAPH_MB:-null},
+            "build_seconds": ${BUILD_SECONDS:-null},
+            "routed_rss_mb": ${ROUTED_RSS_MB:-null},
+            "osrm_version_file": "$(cat osrm-version.txt 2>/dev/null || echo unknown)",
+            "base_image_pin": "$(grep -m1 '^FROM osrm/osrm-backend' osrm/Dockerfile)",
+            "runtime": "osrm-routed --algorithm mld --max-table-size 100 (image entrypoint, PORT-honoring)",
+            "note": "Digest is the authoritative immutable identity; digests may differ across rebuilds of the same commit due to timestamps in image metadata (documented non-byte-reproducibility)."
+          }
+          EOF
+          cat publish-report.json
+          {
+            echo "## hunter-osrm image published"
+            echo '```'
+            echo "docker pull ${IMAGE_NAME}@${IMAGE_DIGEST}"
+            echo '# tag: '"${IMAGE_NAME}:${IMAGE_TAG}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Upload evidence (lightweight logs/JSON only — no PBF, no graph)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osrm-publication-evidence
+          path: |
+            publish-report.json
+            osrm-version.txt
+            image-inspect-local.json
+            image-inspect-pulled.json
+            route-response.json
+            route-response-pulled.json
+            graph-content.txt
+            graph-content-pulled.txt
+            build.log
+            push.log
+            rss-evidence.txt
+            disk-evidence.txt
+          if-no-files-found: warn
+          retention-days: 30
