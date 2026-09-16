@@ -5,7 +5,7 @@
 # REAL Express /api/v1/directions endpoint.
 #
 # Evidence artifacts (uploaded, lightweight): a JSON report with sizes, the
-# PBF md5 (Geofabrik publishes a matching .md5 sidecar — step F), per-step
+# PBF md5 (verified against Geofabrik's .md5 sidecar — step E), per-step
 # timing, disk usage after each preprocessing stage, container RSS, and the
 # route result. The 673 MB PBF and generated graph files are NEVER committed
 # or uploaded — they live only in the ephemeral runner workspace.
@@ -41,26 +41,45 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # --------------------------------------------- B–E. download + integrity
+      # CANONICAL PBF FILENAME: every reference to the extract in this
+      # workflow uses exactly this name (download target = checksum target =
+      # osrm-extract input; osrm tooling derives the graph stem from it, so
+      # graph artifacts become tanzania-latest.osrm*).
       - name: "B. Download Geofabrik Tanzania extract"
         run: |
-          curl -fsSL --retry 3 --retry-delay 5 -o tanzania.osm.pbf \
+          curl -fsSL --retry 3 --retry-delay 5 -o tanzania-latest.osm.pbf \
             https://download.geofabrik.de/africa/tanzania-latest.osm.pbf
-          test -s tanzania.osm.pbf || { echo '::error::download produced an empty file'; exit 1; }
+          test -s tanzania-latest.osm.pbf || { echo '::error::download produced an empty file'; exit 1; }
 
       - name: "C/D. Verify non-empty + record actual size"
         run: |
-          SIZE=$(stat -c%s tanzania.osm.pbf)
+          SIZE=$(stat -c%s tanzania-latest.osm.pbf)
           echo "tanzania_pbf_bytes=$SIZE" >> "$GITHUB_ENV"
           echo "PBF size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
           test "$SIZE" -gt 500000000 || { echo '::error::PBF unexpectedly small — wrong/truncated file'; exit 1; }
 
       - name: "E. Verify integrity against Geofabrik .md5 sidecar"
         run: |
-          curl -fsSL --retry 3 -o tanzania.osm.pbf.md5 https://download.geofabrik.de/africa/tanzania-latest.osm.pbf.md5
-          md5sum -c tanzania.osm.pbf.md5
-          MD5=$(awk '{print $1}' tanzania.osm.pbf.md5)
-          echo "tanzania_pbf_md5=$MD5" >> "$GITHUB_ENV"
-          echo "PBF md5: $MD5 (Geofabrik-published sidecar verified)"
+          set -euo pipefail
+          PBF=tanzania-latest.osm.pbf
+          curl -fsSL --retry 3 -o "$PBF.md5" https://download.geofabrik.de/africa/tanzania-latest.osm.pbf.md5
+          test -s "$PBF"     || { echo '::error::PBF missing/empty before checksum'; exit 1; }
+          test -s "$PBF.md5" || { echo '::error::md5 sidecar missing/empty'; exit 1; }
+          echo "PBF file: $PBF"
+          echo "PBF size: $(stat -c%s "$PBF") bytes"
+          # Geofabrik sidecars embed the REMOTE filename, which md5sum -c would
+          # resolve literally. Verify the downloaded BYTES against the official
+          # value instead — filename-independent, verification never skipped.
+          EXPECTED=$(awk '{print $1}' "$PBF.md5")
+          ACTUAL=$(md5sum "$PBF" | awk '{print $1}')
+          echo "sidecar md5: $EXPECTED"
+          echo "actual  md5: $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo '::error::MD5 mismatch — downloaded PBF does not match the official Geofabrik checksum'
+            exit 1
+          fi
+          echo "MD5: VERIFIED (downloaded bytes match the official Geofabrik md5)"
+          echo "tanzania_pbf_md5=$EXPECTED" >> "$GITHUB_ENV"
 
       # ------------------------------------------- F. pinned OSRM preprocessing
       - name: "F. Install pinned OSRM v5.25.0 binaries (official toolchain)"
@@ -81,7 +100,7 @@ jobs:
           lua_ver=$(ls /usr/share/osrm/profiles/car.lua 2>/dev/null || ls /opt/car.lua 2>/dev/null || find /usr -name car.lua 2>/dev/null | head -1)
           test -n "$lua_ver" || { echo '::error::car profile not found in osrm-backend package'; exit 1; }
           echo "profile: $lua_ver"
-          osrm-extract -p "$lua_ver" tanzania.osm.pbf 2>&1 | tee extract.log
+          osrm-extract -p "$lua_ver" tanzania-latest.osm.pbf 2>&1 | tee extract.log
           grep -E "\[error|error" extract.log && { echo '::error::osrm-extract reported errors'; exit 1; } || true
           echo "extract_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
@@ -89,7 +108,7 @@ jobs:
       - name: "F2. osrm-partition (MLD)"
         run: |
           START=$SECONDS
-          osrm-partition tanzania.osrm 2>&1 | tee partition.log
+          osrm-partition tanzania-latest.osrm 2>&1 | tee partition.log
           grep -iE "\[error" partition.log && { echo '::error::osrm-partition reported errors'; exit 1; } || true
           echo "partition_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
@@ -97,15 +116,15 @@ jobs:
       - name: "F3. osrm-customize (MLD)"
         run: |
           START=$SECONDS
-          osrm-customize tanzania.osrm 2>&1 | tee customize.log
+          osrm-customize tanzania-latest.osrm 2>&1 | tee customize.log
           grep -iE "\[error" customize.log && { echo '::error::osrm-customize reported errors'; exit 1; } || true
           echo "customize_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
           # Graph artifacts that MUST exist after the full MLD pipeline:
-          ls -lh tanzania.osrm* | tee artifacts-list.txt
-          for f in tanzania.osrm tanzania.osrm.geometry tanzania.osrm.partition tanzania.osrm.cells \
-                   tanzania.osrm.mldgr tanzania.osrm.properties tanzania.osrm.fileIndex \
-                   tanzania.osrm.levelIndex; do
+          ls -lh tanzania-latest.osrm* | tee artifacts-list.txt
+          for f in tanzania-latest.osrm tanzania-latest.osrm.geometry tanzania-latest.osrm.partition tanzania-latest.osrm.cells \
+                   tanzania-latest.osrm.mldgr tanzania-latest.osrm.properties tanzania-latest.osrm.fileIndex \
+                   tanzania-latest.osrm.levelIndex; do
             test -s "$f" || { echo "::error::missing graph artifact: $f"; exit 1; }
           done
           GRAPH_MB=$(( $(du -sm --exclude='*.pbf*' . | cut -f1) ))
@@ -113,12 +132,12 @@ jobs:
           echo "Graph artifacts total (PBF excluded): ${GRAPH_MB} MB"
 
       - name: "F4. Free the PBF (runtime does not need it)"
-        run: rm -f tanzania.osm.pbf tanzania.osm.pbf.md5
+        run: rm -f tanzania-latest.osm.pbf tanzania-latest.osm.pbf.md5
 
       # --------------------------------------------------- G–I. serve + query
       - name: "G. Start osrm-routed against the prepared graph"
         run: |
-          osrm-routed --algorithm mld --max-table-size 100 --port 5000 tanzania.osrm > routed.log 2>&1 &
+          osrm-routed --algorithm mld --max-table-size 100 --port 5000 tanzania-latest.osrm > routed.log 2>&1 &
           echo $! > routed.pid
 
       - name: "H. Wait for OSRM readiness (graph load)"

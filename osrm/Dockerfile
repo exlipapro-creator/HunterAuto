@@ -23,19 +23,23 @@ ARG PBF_URL=https://download.geofabrik.de/africa/tanzania-latest.osm.pbf
 ENV PBF_URL=${PBF_URL}
 
 WORKDIR /data
-ADD ${PBF_URL} /data/tanzania.osm.pbf
+# CANONICAL PBF FILENAME — matches .github/workflows/verify-osrm.yml so the
+# CI pipeline and the image build use identical naming end-to-end (download
+# target = checksum target = osrm-extract input; osrm tooling derives the
+# graph stem from the input filename).
+ADD ${PBF_URL} /data/tanzania-latest.osm.pbf
 
 # Car profile (passenger-car road navigation) ships inside the image at
 # /opt/car.lua. MLD pipeline: extract → partition → customize.
-RUN osrm-extract -p /opt/car.lua /data/tanzania.osm.pbf \
+RUN osrm-extract -p /opt/car.lua /data/tanzania-latest.osm.pbf \
  && echo "after osrm-extract:" && du -sh /data
 
-RUN osrm-partition /data/tanzania.osrm \
+RUN osrm-partition /data/tanzania-latest.osrm \
  && echo "after osrm-partition:" && du -sh /data
 
-RUN osrm-customize /data/tanzania.osrm \
+RUN osrm-customize /data/tanzania-latest.osrm \
  && echo "after osrm-customize:" && du -sh /data \
- && rm -f /data/tanzania.osm.pbf \
+ && rm -f /data/tanzania-latest.osm.pbf \
  && echo "final graph artifacts:" && ls -lh /data
 
 FROM osrm/osrm-backend:v5.25.0
@@ -50,4 +54,4 @@ EXPOSE 5000
 # container start. No arbitrary-params hardening is needed here: the Hunter
 # Express server is the ONLY permitted client (Render private network), and
 # it constructs the upstream URL itself from a validated, fixed shape.
-ENTRYPOINT ["sh", "-c", "exec osrm-routed --algorithm mld --max-table-size 100 --port ${PORT:-5000} /data/tanzania.osrm"]
+ENTRYPOINT ["sh", "-c", "exec osrm-routed --algorithm mld --max-table-size 100 --port ${PORT:-5000} /data/tanzania-latest.osrm"]
