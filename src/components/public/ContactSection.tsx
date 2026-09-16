@@ -115,7 +115,7 @@ export const ContactSection: React.FC = () => {
                 Block 41, Kinondoni Morocco, Dar es Salaam
               </p>
               <div className="text-[11px] font-mono-telemetry text-slate-400 mt-2">
-                GPS: -6.7865° S, 39.2624° E
+                GPS: -6.7789875° S, 39.265234375° E
               </div>
 
               <div className="mt-4 flex items-center gap-2">
