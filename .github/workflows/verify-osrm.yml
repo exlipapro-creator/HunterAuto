@@ -132,16 +132,20 @@ jobs:
           grep -iE "\[error" customize.log && { echo '::error::osrm-customize reported errors'; exit 1; } || true
           echo "customize_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
-          # Graph artifacts that MUST exist after the full MLD pipeline:
+          # Graph artifacts that MUST exist after the full MLD pipeline.
+          # Version-stable set only (verified against real osrm-backend v5.25.0
+          # output, run 35087863348): the full per-version listing is captured
+          # in artifacts-list.txt for the evidence record. (.fileIndex and
+          # .cell_metrics are version-specific and NOT required here.)
           ls -lh tanzania-latest.osrm* | tee artifacts-list.txt
-          for f in tanzania-latest.osrm tanzania-latest.osrm.geometry tanzania-latest.osrm.partition tanzania-latest.osrm.cells \
-                   tanzania-latest.osrm.mldgr tanzania-latest.osrm.properties tanzania-latest.osrm.fileIndex \
-                   tanzania-latest.osrm.levelIndex; do
+          for f in tanzania-latest.osrm tanzania-latest.osrm.geometry tanzania-latest.osrm.properties \
+                   tanzania-latest.osrm.partition tanzania-latest.osrm.cells tanzania-latest.osrm.mldgr; do
             test -s "$f" || { echo "::error::missing graph artifact: $f"; exit 1; }
           done
           GRAPH_MB=$(( $(du -sm --exclude='*.pbf*' . | cut -f1) ))
           echo "graph_mb=$GRAPH_MB" >> "$GITHUB_ENV"
           echo "Graph artifacts total (PBF excluded): ${GRAPH_MB} MB"
+          test "$GRAPH_MB" -ge 1000 || { echo "::error::graph implausibly small (${GRAPH_MB} MB) — preprocessing incomplete"; exit 1; }
 
       - name: "F4. Free the PBF (runtime does not need it)"
         run: rm -f tanzania-latest.osm.pbf tanzania-latest.osm.pbf.md5
