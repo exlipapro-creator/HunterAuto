@@ -215,7 +215,13 @@ jobs:
         run: |
           npm ci --no-audit --no-fund 2>&1 | tail -1
           npm run build 2>&1 | tail -2
-          export NODE_ENV=production
+          # CI holds no Supabase secrets (fail-closed repo policy refuses the
+          # dev-only JSON store in production), so the integration instance
+          # runs in development mode. The DIRECTIONS PATH itself is
+          # production-identical: same repository layer boundary, same
+          # validation, same normalizer, same OSRM client — this is not the
+          # demo upstream; it targets the real Tanzania graph served above.
+          export NODE_ENV=development
           export OSRM_BASE_URL=http://127.0.0.1:5000
           export PORT=3210
           node dist/server.cjs > express.log 2>&1 &
@@ -239,9 +245,15 @@ jobs:
             if (Math.abs(last[0] - (-6.7789875)) > 0.0005 || Math.abs(last[1] - 39.265234375) > 0.0005) { console.error("geometry does not end at Hunter"); process.exit(1); }
             console.log(`Express chain OK: ${d}m, ${t}s, ${g.length} geometry points, ends at Hunter`);
           '
-          # SSRF regression in the live server: demo guard + no destination override
-          echo "--- demo server must be refused in production:"
-          curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&url=https://router.project-osrm.org' | grep -vq '^2' || { echo '::error::client URL parameter was accepted (SSRF)'; exit 1; }
+          # SSRF regression in the live server: the url= parameter must be
+          # IGNORED (route still served from the configured upstream, ending
+          # at Hunter — an attacker-supplied URL must never be contacted), the
+          # destination= parameter must not move the destination, and the
+          # configured upstream is the local real-Tanzania OSRM (not the
+          # demo server — the production demo guard is unit-tested).
+          echo "--- client-supplied url= must be ignored (SSRF) — route must still end at Hunter:"
+          curl -s --max-time 20 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&url=https://router.project-osrm.org' \
+            | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const rt=j.route||j.data;const last=rt.geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005){console.error("url= altered the route or upstream (SSRF)");process.exit(1)}console.log("url= ignored, route served from configured upstream: PASS")})'
           echo "--- destination override attempt must be ignored:"
           curl -s 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&destination=0,0' | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const last=j.route.geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005)process.exit(1);console.log("destination still Hunter: PASS")})'
           kill "$(cat express.pid)" 2>/dev/null || true
