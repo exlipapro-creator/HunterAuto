@@ -1,5 +1,6 @@
 import React from 'react';
 import { Phone, MessageSquare, MapPin, Clock, ShieldCheck, Navigation } from 'lucide-react';
+import { TakeMeToHunter } from './TakeMeToHunter';
 
 export const ContactSection: React.FC = () => {
   return (
@@ -99,37 +100,9 @@ export const ContactSection: React.FC = () => {
               </span>
             </div>
 
-            {/* Stylized Dark Mechanical Facility Blueprint Map */}
-            <div className="h-64 sm:h-72 w-full rounded-lg bg-[#00101F] border border-[#132038] relative overflow-hidden flex flex-col items-center justify-center tech-grid-bg p-4 text-center">
-              {/* Radial pulse on workshop location */}
-              <div className="w-16 h-16 rounded-full bg-[#159EF3]/20 border border-[#159EF3] flex items-center justify-center animate-pulse mb-3 shadow-[0_0_30px_rgba(21,158,243,0.4)]">
-                <div className="w-6 h-6 rounded-full bg-[#159EF3] text-black flex items-center justify-center font-bold text-xs">
-                  H
-                </div>
-              </div>
-
-              <h4 className="font-display font-bold text-lg text-white uppercase">
-                HUNTER AUTOWORKS
-              </h4>
-              <p className="text-xs font-mono-telemetry text-[#159EF3] mt-0.5">
-                Block 41, Kinondoni Morocco, Dar es Salaam
-              </p>
-              <div className="text-[11px] font-mono-telemetry text-slate-400 mt-2">
-                GPS: -6.7789875° S, 39.265234375° E
-              </div>
-
-              <div className="mt-4 flex items-center gap-2">
-                <a
-                  href="https://maps.google.com/?q=Kinondoni+Morocco+Block+41+Dar+es+Salaam"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="bg-[#002958] hover:bg-[#159EF3] hover:text-black text-[#159EF3] border border-[#159EF3]/50 text-xs font-mono-telemetry px-4 py-2 rounded transition-colors"
-                  id="google-maps-directions-btn"
-                >
-                  Open in Google Maps
-                </a>
-              </div>
-            </div>
+            {/* In-site live navigation ("Take Me to Hunter") — the Leaflet map
+                code lives in a lazy chunk that loads only on activation. */}
+            <TakeMeToHunter />
 
             {/* Facilities Telemetry */}
             <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-[#132038] text-center font-mono-telemetry text-xs">

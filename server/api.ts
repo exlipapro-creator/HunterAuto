@@ -6,6 +6,7 @@ import { accountRouter } from './lib/routes-account.js';
 import { requireAuth, AuthedRequest } from './lib/auth.js';
 import type { AuthenticatedActor } from './lib/supabaseAdmin.js';
 import { isSupabaseConfigured, getSupabaseAdmin } from './lib/supabaseAdmin.js';
+import { parseFromParam, fetchDirections, type DirectionsErrorCode } from './lib/directions.js';
 import type { WorkOrderStatus, InspectionReport } from '../src/types.js';
 
 /**
@@ -18,7 +19,7 @@ import type { WorkOrderStatus, InspectionReport } from '../src/types.js';
  *                               /availability (read), /appointments (POST = guest booking),
  *                               /service-status/:reference (read, sanitized),
  *                               /invoices/verify/:token (read, token-gated),
- *                               /public/settings (read, business info only)
+ *                               /public/settings (read, business info only), /directions (read, rate-limited, server-routed)
  *
  * STAFF (Bearer token + RBAC):  everything else.
  *
@@ -120,6 +121,61 @@ apiRouter.get('/health', async (_req: Request, res: Response) => {
   };
   if (!ok) body.status = 'degraded';
   res.status(ok ? 200 : 503).json(body);
+});
+
+// ============================================================
+// PUBLIC: in-site navigation ("Take Me to Hunter")
+// ============================================================
+// Thin, fail-closed boundary over the configured OSRM upstream.
+//  - Public (customers navigate without staff auth) but STRICTLY rate-limited:
+//    navigation legitimately recalculates occasionally (150 m / 60 s gates),
+//    so the budget allows a normal session while stopping abuse.
+//  - `from` is the ONLY client input; it is strictly validated. The
+//    destination always comes from the server-authoritative Hunter location.
+//  - No client-supplied URL/destination can ever reach the upstream — the
+//    endpoint cannot be used as an SSRF proxy.
+//  - Customer coordinates are NEVER logged (the service logs only status
+//    classes; the request query is never echoed, cached, or persisted).
+const directionsHits = new Map<string, { count: number; firstAt: number }>();
+// 20 requests/min/IP: a normal navigation session recalculates at most
+// ~1/min plus a few manual retries — this leaves generous headroom.
+const DIRECTIONS_RATE_LIMIT = 20;
+function directionsRateLimited(req: Request): boolean {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const rec = directionsHits.get(ip);
+  if (!rec || now - rec.firstAt > 60_000) {
+    directionsHits.set(ip, { count: 1, firstAt: now });
+    return false;
+  }
+  rec.count += 1;
+  return rec.count > DIRECTIONS_RATE_LIMIT;
+}
+
+apiRouter.get('/directions', async (req: Request, res: Response) => {
+  if (directionsRateLimited(req)) {
+    return res.status(429).json({ success: false, error: 'Too many route requests. Please slow down.', code: 'RATE_LIMITED' });
+  }
+  const parsed = parseFromParam(req.query.from as string | undefined);
+  if (!parsed) {
+    return res.status(400).json({ success: false, error: 'Invalid coordinates.', code: 'INVALID_COORDINATES' });
+  }
+  const result = await fetchDirections(parsed, process.env);
+  if (result.ok) {
+    // Short client-side cache: repeated identical fixes within seconds are
+    // pointless upstream calls. Route freshness is governed client-side by the
+    // 60 s recalculation gate, not by aggressive caching here.
+    res.set('Cache-Control', 'private, max-age=10');
+    return res.json({ success: true, data: result.route });
+  }
+  const failure = result as { code: DirectionsErrorCode; httpStatus: number };
+  const messages: Record<DirectionsErrorCode, string> = {
+    INVALID_COORDINATES: 'Invalid coordinates.',
+    ROUTING_NOT_CONFIGURED: 'Live routing is temporarily unavailable.',
+    ROUTING_UNAVAILABLE: 'Live routing is temporarily unavailable.',
+    ROUTE_UNAVAILABLE: 'No route could be calculated right now.',
+  };
+  return res.status(failure.httpStatus).json({ success: false, error: messages[failure.code], code: failure.code });
 });
 
 apiRouter.get('/services', async (_req: Request, res: Response) => {
