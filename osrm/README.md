@@ -72,9 +72,10 @@ web service):
 
 1. **CI (this repo):** `.github/workflows/verify-osrm.yml` (manual dispatch)
    performs the real pipeline on a 16 GB Ubuntu runner: download + md5-verify
-   the Tanzania PBF → pinned OSRM v5.25.0 (official `osrm/ppa` binaries,
-   matching the image pin) `osrm-extract` → `osrm-partition` → `osrm-customize`
-   → artifact existence checks → `osrm-routed` → real route request ending at
+   the Tanzania PBF → **pinned production image** `osrm/osrm-backend:v5.25.0`
+   (workspace mounted at /data — the exact binary production preprocessing
+   uses) `osrm-extract` → `osrm-partition` → `osrm-customize`
+   → artifact existence checks → `osrm-routed` (same pinned image) → real route request ending at
    Hunter's confirmed coordinate → Tanzania-bbox plausibility → **full
    Express chain** (`dist/server.cjs` with `OSRM_BASE_URL` pointing at the
    real osrm-routed: normalized `{distanceMeters, durationSeconds, geometry}`,

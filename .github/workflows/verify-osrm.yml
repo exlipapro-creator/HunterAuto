@@ -81,42 +81,54 @@ jobs:
           echo "MD5: VERIFIED (downloaded bytes match the official Geofabrik md5)"
           echo "tanzania_pbf_md5=$EXPECTED" >> "$GITHUB_ENV"
 
-      # ------------------------------------------- F. pinned OSRM preprocessing
-      - name: "F. Install pinned OSRM v5.25.0 binaries (official toolchain)"
+      # ------------------------------------------- F. pinned OSRM toolchain
+      # TOOLCHAIN = the production image itself (osrm/osrm-backend:v5.25.0,
+      # byte-identical to the osrm/Dockerfile pin). No PPA, no apt package,
+      # no floating tag: every OSRM binary below runs from the pinned image
+      # with the workspace mounted at /data, so generated graph files land
+      # back in the runner workspace (no Docker-in-Docker; the daemon that
+      # ships with ubuntu-latest is used directly).
+      - name: "F. Verify pinned OSRM v5.25.0 Docker toolchain (production image)"
         run: |
-          # The official project PPA (signed, publishes upstream release builds)
-          # provides exactly the pinned version, matching the Docker image pin.
-          sudo add-apt-repository -y ppa:osrm/ppa
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends osrm-backend=5.25.0-1~jammy1 2>/dev/null \
-            || sudo apt-get install -y --no-install-recommends osrm-backend
-          osrm-extract --version && osrm-partition --version && osrm-customize --version
-          echo "osrm_version=$(osrm-extract --version 2>/dev/null | head -1)" >> "$GITHUB_ENV"
+          docker --version || { echo '::error::Docker daemon not available on runner'; exit 1; }
+          docker pull osrm/osrm-backend:v5.25.0
+          docker image inspect osrm/osrm-backend:v5.25.0 > image-inspect.json
+          DIGEST=$(node -e 'const i=require("./image-inspect.json");console.log(i[0].RepoDigests[0]||"(no repo digest)")')
+          ID=$(node -e 'const i=require("./image-inspect.json");console.log(i[0].Id)')
+          echo "image digest: $DIGEST"
+          echo "image id:     $ID"
+          echo "osrm_image_digest=$DIGEST" >> "$GITHUB_ENV"
+          echo "osrm_image_id=$ID" >> "$GITHUB_ENV"
+          # Version proof from INSIDE the pinned image (must match the pin):
+          docker run --rm osrm/osrm-backend:v5.25.0 osrm-extract --version 2>&1 | head -1 | tee osrm-version.txt
+          echo "osrm_version=$(head -1 osrm-version.txt)" >> "$GITHUB_ENV"
 
-      - name: "F1. osrm-extract (car profile)"
+      - name: "F1. osrm-extract (car profile, pinned image, workspace mounted at /data)"
         run: |
           START=$SECONDS
-          # car.lua ships with the osrm-backend package (car profile = passenger cars).
-          lua_ver=$(ls /usr/share/osrm/profiles/car.lua 2>/dev/null || ls /opt/car.lua 2>/dev/null || find /usr -name car.lua 2>/dev/null | head -1)
-          test -n "$lua_ver" || { echo '::error::car profile not found in osrm-backend package'; exit 1; }
-          echo "profile: $lua_ver"
-          osrm-extract -p "$lua_ver" tanzania-latest.osm.pbf 2>&1 | tee extract.log
+          # Car profile path verified against the production Dockerfile (/opt/car.lua).
+          docker run --rm -v "$PWD:/data" -w /data osrm/osrm-backend:v5.25.0 \
+            sh -c 'test -s /opt/car.lua || { echo "car profile missing in pinned image"; exit 1; } && exec osrm-extract -p /opt/car.lua /data/tanzania-latest.osm.pbf' \
+            2>&1 | tee extract.log
           grep -E "\[error|error" extract.log && { echo '::error::osrm-extract reported errors'; exit 1; } || true
+          test -s tanzania-latest.osrm || { echo '::error::osrm-extract produced no graph base file in the mounted workspace'; exit 1; }
           echo "extract_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
 
-      - name: "F2. osrm-partition (MLD)"
+      - name: "F2. osrm-partition (MLD, pinned image)"
         run: |
           START=$SECONDS
-          osrm-partition tanzania-latest.osrm 2>&1 | tee partition.log
+          docker run --rm -v "$PWD:/data" -w /data osrm/osrm-backend:v5.25.0 \
+            osrm-partition /data/tanzania-latest.osrm 2>&1 | tee partition.log
           grep -iE "\[error" partition.log && { echo '::error::osrm-partition reported errors'; exit 1; } || true
           echo "partition_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
 
-      - name: "F3. osrm-customize (MLD)"
+      - name: "F3. osrm-customize (MLD, pinned image)"
         run: |
           START=$SECONDS
-          osrm-customize tanzania-latest.osrm 2>&1 | tee customize.log
+          docker run --rm -v "$PWD:/data" -w /data osrm/osrm-backend:v5.25.0 \
+            osrm-customize /data/tanzania-latest.osrm 2>&1 | tee customize.log
           grep -iE "\[error" customize.log && { echo '::error::osrm-customize reported errors'; exit 1; } || true
           echo "customize_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
           du -sh . | tee -a disk-evidence.txt
@@ -135,10 +147,14 @@ jobs:
         run: rm -f tanzania-latest.osm.pbf tanzania-latest.osm.pbf.md5
 
       # --------------------------------------------------- G–I. serve + query
-      - name: "G. Start osrm-routed against the prepared graph"
+      - name: "G. Start osrm-routed (pinned image, host network) against the prepared graph"
         run: |
-          osrm-routed --algorithm mld --max-table-size 100 --port 5000 tanzania-latest.osrm > routed.log 2>&1 &
-          echo $! > routed.pid
+          # Host network: the container's osrm-routed binds 0.0.0.0:5000 in the
+          # runner's own namespace, so 127.0.0.1:5000 works for every later step.
+          docker run -d --name hunter-osrm-ci --network host \
+            -v "$PWD:/data" -w /data osrm/osrm-backend:v5.25.0 \
+            osrm-routed --algorithm mld --max-table-size 100 --port 5000 /data/tanzania-latest.osrm
+          docker ps --filter name=hunter-osrm-ci --format 'container: {{.Image}} {{.Status}}'
 
       - name: "H. Wait for OSRM readiness (graph load)"
         run: |
@@ -146,12 +162,17 @@ jobs:
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
               'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
             if [ "$code" = "200" ]; then echo "OSRM ready after ~$((i * 2))s"; exit 0; fi
-            if ! kill -0 "$(cat routed.pid)" 2>/dev/null; then
-              echo '::error::osrm-routed exited during startup (graph load failure)'; tail -30 routed.log; exit 1
+            running=$(docker inspect -f '{{.State.Running}}' hunter-osrm-ci 2>/dev/null || echo 'false')
+            if [ "$running" != 'true' ]; then
+              echo '::error::osrm-routed container exited during startup (graph load failure)'
+              docker logs --tail 40 hunter-osrm-ci 2>&1 | tee routed.log || true
+              exit 1
             fi
             sleep 2
           done
-          echo '::error::osrm-routed never became ready (180s)'; tail -30 routed.log; exit 1
+          echo '::error::osrm-routed never became ready (180s)'
+          docker logs --tail 40 hunter-osrm-ci 2>&1 | tee routed.log || true
+          exit 1
 
       - name: "J. REAL routing request (in-city Dar es Salaam road route)"
         id: route
@@ -221,19 +242,27 @@ jobs:
           curl -s 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&destination=0,0' | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const last=j.route.geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005)process.exit(1);console.log("destination still Hunter: PASS")})'
           kill "$(cat express.pid)" 2>/dev/null || true
 
-      - name: "M. Peak resource observation (osrm-routed RSS)"
+      - name: "M. Peak resource observation (osrm-routed container RSS)"
         if: always()
         run: |
-          if [ -f routed.pid ] && kill -0 "$(cat routed.pid)" 2>/dev/null; then
-            ps -o pid,rss,vsz,cmd -p "$(cat routed.pid)" | tee rss-evidence.txt
-            echo "routed_rss_mb=$(( $(ps -o rss= -p "$(cat routed.pid)") / 1024 ))" >> "$GITHUB_ENV"
+          if docker inspect -f '{{.State.Running}}' hunter-osrm-ci 2>/dev/null | grep -q true; then
+            USAGE=$(docker stats --no-stream --format '{{.MemUsage}}' hunter-osrm-ci)
+            echo "osrm-routed container memory: $USAGE" | tee rss-evidence.txt
+            NUM=$(echo "$USAGE" | awk '{print $1}' | tr -d ' GiB')
+            UNIT=$(echo "$USAGE" | awk '{print $1}' | grep -o 'GiB\|MiB' || echo 'MiB')
+            case "$UNIT" in
+              GiB) MB=$(awk "BEGIN{printf \"%d\", $NUM * 1024}") ;;
+              *)   MB=$(awk "BEGIN{printf \"%d\", $NUM}") ;;
+            esac
+            echo "routed_rss_mb=$MB" >> "$GITHUB_ENV"
+          else
+            echo "osrm-routed container not running at evidence time" | tee rss-evidence.txt
           fi
 
       - name: "M. Stop OSRM cleanly"
         if: always()
         run: |
-          [ -f routed.pid ] && kill "$(cat routed.pid)" 2>/dev/null || true
-          sleep 1
+          docker rm -f hunter-osrm-ci 2>/dev/null || true
 
       # ------------------------------------------------------------- N. report
       - name: "N. Verification report"
@@ -242,8 +271,11 @@ jobs:
           cat > verification-report.json <<EOF
           {
             "date": "$(date -u +%FT%TZ)",
-            "osrm_version": "${osrm_version:-unknown}",
+            "osrm_image": "osrm/osrm-backend:v5.25.0",
+            "osrm_image_digest": "${osrm_image_digest:-unknown}",
+            "osrm_image_id": "${osrm_image_id:-unknown}",
             "osrm_docker_pin": "$(grep -m1 'FROM osrm/osrm-backend' osrm/Dockerfile)",
+            "toolchain_note": "CI preprocessing ran inside the production pinned image (workspace mounted at /data) — identical binary to production",
             "pbf_source": "https://download.geofabrik.de/africa/tanzania-latest.osm.pbf",
             "pbf_bytes": ${tanzania_pbf_bytes:-0},
             "pbf_md5_geofabrik": "${tanzania_pbf_md5:-not_verified}",
@@ -276,5 +308,7 @@ jobs:
             disk-evidence.txt
             rss-evidence.txt
             artifacts-list.txt
+            osrm-version.txt
+            image-inspect.json
           if-no-files-found: warn
           retention-days: 30
