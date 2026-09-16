@@ -236,7 +236,7 @@ jobs:
           curl -sf --max-time 20 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443' -o directions-response.json
           node -e '
             const r = require("./directions-response.json");
-            const rt = r.route ?? r; // tolerant to {route:{...}} wrapper
+            const rt = r.route || r.data; // {route:...} or {success,data:{...}} envelope
             const d = rt.distanceMeters, t = rt.durationSeconds, g = rt.geometry;
             if (!(typeof d === "number" && d > 0 && Number.isFinite(d))) { console.error("bad distanceMeters:", d); process.exit(1); }
             if (!(typeof t === "number" && t > 0 && Number.isFinite(t))) { console.error("bad durationSeconds:", t); process.exit(1); }
@@ -255,7 +255,7 @@ jobs:
           curl -s --max-time 20 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&url=https://router.project-osrm.org' \
             | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const rt=j.route||j.data;const last=rt.geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005){console.error("url= altered the route or upstream (SSRF)");process.exit(1)}console.log("url= ignored, route served from configured upstream: PASS")})'
           echo "--- destination override attempt must be ignored:"
-          curl -s 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&destination=0,0' | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const last=j.route.geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005)process.exit(1);console.log("destination still Hunter: PASS")})'
+          curl -s 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&destination=0,0' | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const last=(j.route||j.data).geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005)process.exit(1);console.log("destination still Hunter: PASS")})'
           kill "$(cat express.pid)" 2>/dev/null || true
 
       - name: "M. Peak resource observation (osrm-routed container RSS)"
