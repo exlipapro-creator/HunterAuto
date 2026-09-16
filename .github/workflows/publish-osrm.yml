@@ -96,18 +96,22 @@ jobs:
 
       - name: "Graph content verification inside the final runtime image"
         run: |
-          # §11: filesystem proof, not size/exit-code inference. The prepared
-          # graph must be present and the source PBF must be GONE (graph-only image).
+          set -o pipefail
+          # §11: filesystem proof, not size/exit-code inference. Artifact set is
+          # ALIGNED with verify-osrm.yml's CI-passed set (v5.25.0 MLD emits no
+          # .nodes file — node data lives in .nbg_nodes). The prepared graph
+          # must be present and the source PBF must be GONE (graph-only image).
           docker run --rm --entrypoint sh "${IMAGE_NAME}:${IMAGE_TAG}" -c '
             ls -lh /data | tee /tmp/ls.txt
-            for f in tanzania-latest.osrm tanzania-latest.osrm.edges tanzania-latest.osrm.geometry \
-                     tanzania-latest.osrm.nodes tanzania-latest.osrm.properties tanzania-latest.osrm.cell_metrics; do
+            for f in tanzania-latest.osrm tanzania-latest.osrm.geometry tanzania-latest.osrm.edges \
+                     tanzania-latest.osrm.properties tanzania-latest.osrm.partition \
+                     tanzania-latest.osrm.cells tanzania-latest.osrm.mldgr; do
               test -s "/data/$f" || { echo "MISSING graph artifact: $f"; exit 1; }
             done
             test ! -f /data/tanzania-latest.osm.pbf || { echo "source PBF must not ship in the runtime image"; exit 1; }
             du -sm /data
           ' | tee graph-content.txt
-          GRAPH_MB=$(grep -oE '^[0-9]+\s+/data$' graph-content.txt | awk '{print $1}')
+          GRAPH_MB=$(grep -oE '^[0-9]+[[:space:]]+/data$' graph-content.txt | awk '{print $1}')
           echo "GRAPH_MB=${GRAPH_MB:-0}" >> "$GITHUB_ENV"
 
       - name: "Runtime smoke: start the built image exactly as production will"
@@ -183,6 +187,7 @@ jobs:
 
       - name: "Pulled image passes the SAME graph + runtime + route gates"
         run: |
+          set -o pipefail
           # §21: the artifact Render will pull is itself production-verified.
           docker run --rm --entrypoint sh "${IMAGE_NAME}@${IMAGE_DIGEST}" -c '
             test -s /data/tanzania-latest.osrm || { echo "graph missing in pulled image"; exit 1; }
