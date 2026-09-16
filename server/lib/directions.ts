@@ -58,6 +58,55 @@ export interface DirectionsFetchLike {
 }
 
 const UPSTREAM_TIMEOUT_MS = 8_000;
+/**
+ * Response-size protection: a route response for a Tanzania-sized region with
+ * a simplified overview is well under 1 MB; anything beyond 5 MB is hostile or
+ * misconfigured upstream behavior and is rejected rather than buffered.
+ */
+const UPSTREAM_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+
+async function readJsonBounded(
+  res: { json: () => Promise<unknown> },
+  fetchImpl: DirectionsFetchLike,
+  signal: AbortSignal,
+): Promise<unknown | null> {
+  // Prefer streaming length accounting when the runtime exposes it; fall back
+  // to buffered parse when it does not (injectable test doubles).
+  const anyRes = res as { body?: ReadableStream<Uint8Array> | null };
+  if (anyRes.body && typeof anyRes.body.getReader === 'function') {
+    const reader = anyRes.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > UPSTREAM_MAX_RESPONSE_BYTES) {
+          try { await reader.cancel(); } catch { /* already closing */ }
+          return null; // oversized — rejected
+        }
+        chunks.push(value);
+      }
+    } catch {
+      return null;
+    }
+    try {
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
+      return JSON.parse(new TextDecoder().decode(merged));
+    } catch {
+      return null;
+    }
+  }
+  void fetchImpl; void signal;
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
 
 /** The public OSRM demo server — acceptable for local dev ONLY, never production. */
 const OSRM_DEMO_HOST = 'router.project-osrm.org';
@@ -111,14 +160,18 @@ export async function fetchDirections(
       console.error(`[directions] upstream failed (status ${Math.floor(res.status / 100)}xx)`);
       return { ok: false, code: 'ROUTING_UNAVAILABLE', httpStatus: 502 };
     }
-    const body = (await res.json()) as {
+    const body = (await readJsonBounded(res, fetchImpl, ctrl.signal)) as {
       code?: string;
       routes?: Array<{
         distance?: unknown;
         duration?: unknown;
         geometry?: { coordinates?: unknown };
       }>;
-    };
+    } | null;
+    if (!body) {
+      // Oversized or unparseable upstream body.
+      return { ok: false, code: 'ROUTE_UNAVAILABLE', httpStatus: 502 };
+    }
     if (body?.code !== 'Ok' || !Array.isArray(body.routes) || body.routes.length === 0) {
       return { ok: false, code: 'ROUTE_UNAVAILABLE', httpStatus: 404 };
     }

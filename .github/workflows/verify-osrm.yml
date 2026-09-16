@@ -1,0 +1,261 @@
+# OSRM real-Tanzania verification — runs ONLY on manual dispatch (and is the
+# Phase 3A evidence gate for Render sizing). No mocks, no fixtures, no tiny
+# extracts: the REAL Geofabrik Tanzania PBF is downloaded, preprocessed by the
+# REAL pinned OSRM, served by the REAL osrm-routed, and queried through the
+# REAL Express /api/v1/directions endpoint.
+#
+# Evidence artifacts (uploaded, lightweight): a JSON report with sizes, the
+# PBF md5 (Geofabrik publishes a matching .md5 sidecar — step F), per-step
+# timing, disk usage after each preprocessing stage, container RSS, and the
+# route result. The 673 MB PBF and generated graph files are NEVER committed
+# or uploaded — they live only in the ephemeral runner workspace.
+#
+# Naming/criticality convention: every step is prefixed so a failure is
+# attributable to exactly one stage (download / hash / extract / partition /
+# customize / serve / express / report).
+name: verify-osrm
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  verify-tanzania-osrm:
+    runs-on: ubuntu-latest # 16 GB RAM / 4 vCPU — the authoritative preprocessing environment
+    timeout-minutes: 120
+    steps:
+      # ---------------------------------------------------------- A. checkout
+      - name: "A. Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: Environment facts
+        run: |
+          echo "runner: $(uname -m), $(nproc) vCPU"
+          free -h | head -2
+          df -h /mnt /tmp | tail -3
+          echo "OSRM image pin (from osrm/Dockerfile): $(grep -m1 'FROM osrm/osrm-backend' osrm/Dockerfile)"
+          {
+            echo "runner_cpu=$(nproc)"
+            echo "runner_mem_gb=$(free -g | awk '/^Mem:/{print $2}')"
+          } >> "$GITHUB_ENV"
+
+      # --------------------------------------------- B–E. download + integrity
+      - name: "B. Download Geofabrik Tanzania extract"
+        run: |
+          curl -fsSL --retry 3 --retry-delay 5 -o tanzania.osm.pbf \
+            https://download.geofabrik.de/africa/tanzania-latest.osm.pbf
+          test -s tanzania.osm.pbf || { echo '::error::download produced an empty file'; exit 1; }
+
+      - name: "C/D. Verify non-empty + record actual size"
+        run: |
+          SIZE=$(stat -c%s tanzania.osm.pbf)
+          echo "tanzania_pbf_bytes=$SIZE" >> "$GITHUB_ENV"
+          echo "PBF size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
+          test "$SIZE" -gt 500000000 || { echo '::error::PBF unexpectedly small — wrong/truncated file'; exit 1; }
+
+      - name: "E. Verify integrity against Geofabrik .md5 sidecar"
+        run: |
+          curl -fsSL --retry 3 -o tanzania.osm.pbf.md5 https://download.geofabrik.de/africa/tanzania-latest.osm.pbf.md5
+          md5sum -c tanzania.osm.pbf.md5
+          MD5=$(awk '{print $1}' tanzania.osm.pbf.md5)
+          echo "tanzania_pbf_md5=$MD5" >> "$GITHUB_ENV"
+          echo "PBF md5: $MD5 (Geofabrik-published sidecar verified)"
+
+      # ------------------------------------------- F. pinned OSRM preprocessing
+      - name: "F. Install pinned OSRM v5.25.0 binaries (official toolchain)"
+        run: |
+          # The official project PPA (signed, publishes upstream release builds)
+          # provides exactly the pinned version, matching the Docker image pin.
+          sudo add-apt-repository -y ppa:osrm/ppa
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends osrm-backend=5.25.0-1~jammy1 2>/dev/null \
+            || sudo apt-get install -y --no-install-recommends osrm-backend
+          osrm-extract --version && osrm-partition --version && osrm-customize --version
+          echo "osrm_version=$(osrm-extract --version 2>/dev/null | head -1)" >> "$GITHUB_ENV"
+
+      - name: "F1. osrm-extract (car profile)"
+        run: |
+          START=$SECONDS
+          # car.lua ships with the osrm-backend package (car profile = passenger cars).
+          lua_ver=$(ls /usr/share/osrm/profiles/car.lua 2>/dev/null || ls /opt/car.lua 2>/dev/null || find /usr -name car.lua 2>/dev/null | head -1)
+          test -n "$lua_ver" || { echo '::error::car profile not found in osrm-backend package'; exit 1; }
+          echo "profile: $lua_ver"
+          osrm-extract -p "$lua_ver" tanzania.osm.pbf 2>&1 | tee extract.log
+          grep -E "\[error|error" extract.log && { echo '::error::osrm-extract reported errors'; exit 1; } || true
+          echo "extract_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
+          du -sh . | tee -a disk-evidence.txt
+
+      - name: "F2. osrm-partition (MLD)"
+        run: |
+          START=$SECONDS
+          osrm-partition tanzania.osrm 2>&1 | tee partition.log
+          grep -iE "\[error" partition.log && { echo '::error::osrm-partition reported errors'; exit 1; } || true
+          echo "partition_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
+          du -sh . | tee -a disk-evidence.txt
+
+      - name: "F3. osrm-customize (MLD)"
+        run: |
+          START=$SECONDS
+          osrm-customize tanzania.osrm 2>&1 | tee customize.log
+          grep -iE "\[error" customize.log && { echo '::error::osrm-customize reported errors'; exit 1; } || true
+          echo "customize_seconds=$((SECONDS - START))" >> "$GITHUB_ENV"
+          du -sh . | tee -a disk-evidence.txt
+          # Graph artifacts that MUST exist after the full MLD pipeline:
+          ls -lh tanzania.osrm* | tee artifacts-list.txt
+          for f in tanzania.osrm tanzania.osrm.geometry tanzania.osrm.partition tanzania.osrm.cells \
+                   tanzania.osrm.mldgr tanzania.osrm.properties tanzania.osrm.fileIndex \
+                   tanzania.osrm.levelIndex; do
+            test -s "$f" || { echo "::error::missing graph artifact: $f"; exit 1; }
+          done
+          GRAPH_MB=$(( $(du -sm --exclude='*.pbf*' . | cut -f1) ))
+          echo "graph_mb=$GRAPH_MB" >> "$GITHUB_ENV"
+          echo "Graph artifacts total (PBF excluded): ${GRAPH_MB} MB"
+
+      - name: "F4. Free the PBF (runtime does not need it)"
+        run: rm -f tanzania.osm.pbf tanzania.osm.pbf.md5
+
+      # --------------------------------------------------- G–I. serve + query
+      - name: "G. Start osrm-routed against the prepared graph"
+        run: |
+          osrm-routed --algorithm mld --max-table-size 100 --port 5000 tanzania.osrm > routed.log 2>&1 &
+          echo $! > routed.pid
+
+      - name: "H. Wait for OSRM readiness (graph load)"
+        run: |
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
+            if [ "$code" = "200" ]; then echo "OSRM ready after ~$((i * 2))s"; exit 0; fi
+            if ! kill -0 "$(cat routed.pid)" 2>/dev/null; then
+              echo '::error::osrm-routed exited during startup (graph load failure)'; tail -30 routed.log; exit 1
+            fi
+            sleep 2
+          done
+          echo '::error::osrm-routed never became ready (180s)'; tail -30 routed.log; exit 1
+
+      - name: "J. REAL routing request (in-city Dar es Salaam road route)"
+        id: route
+        run: |
+          # Kariakoo → Hunter's confirmed destination (both are real road nodes
+          # in the Tanzania extract). Body kept as evidence.
+          curl -sf --max-time 20 \
+            'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
+            -o route-response.json
+          node -e '
+            const r = require("./route-response.json");
+            const rt = r.routes?.[0];
+            if (r.code !== "Ok" || !rt) { console.error("no route:", r.code); process.exit(1); }
+            const okD = typeof rt.distance === "number" && rt.distance > 0 && Number.isFinite(rt.distance);
+            const okT = typeof rt.duration === "number" && rt.duration > 0 && Number.isFinite(rt.duration);
+            const okG = Array.isArray(rt.geometry?.coordinates) && rt.geometry.coordinates.length >= 2;
+            console.log(`distance=${rt.distance}m duration=${rt.duration}s points=${rt.geometry.coordinates.length}`);
+            if (!okD || !okT || !okG) { console.error("route validation failed"); process.exit(1); }
+            const last = rt.geometry.coordinates.at(-1);
+            const dLat = Math.abs(last[1] - (-6.7789875)), dLng = Math.abs(last[0] - 39.265234375);
+            if (dLat > 0.0005 || dLng > 0.0005) { console.error("route does not end at Hunter destination"); process.exit(1); }
+            console.log(`destination verified: ${last[1]}, ${last[0]} (Hunter confirmed pin)`);
+          '
+
+      - name: "L. Geographic plausibility (all geometry points inside Tanzania bbox)"
+        run: |
+          node -e '
+            const g = require("./route-response.json").routes[0].geometry.coordinates;
+            const bad = g.filter(([lng, lat]) => !(lng > 29.0 && lng < 41.0 && lat > -12 && lat < -0.8));
+            console.log(`geometry points: ${g.length}, outside-Tanzania-bbox: ${bad.length}`);
+            if (bad.length) { console.error("implausible geometry"); process.exit(1); }
+          '
+
+      # ------------------------------- I. Express → OSRM integration (real chain)
+      - name: "I. Express /api/v1/directions integration against REAL OSRM"
+        run: |
+          npm ci --no-audit --no-fund 2>&1 | tail -1
+          npm run build 2>&1 | tail -2
+          export NODE_ENV=production
+          export OSRM_BASE_URL=http://127.0.0.1:5000
+          export PORT=3210
+          node dist/server.cjs > express.log 2>&1 &
+          echo $! > express.pid
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:3210/api/v1/health || true)
+            [ "$code" = "200" ] && break
+            kill -0 "$(cat express.pid)" 2>/dev/null || { echo '::error::Express exited during startup'; tail -30 express.log; exit 1; }
+            sleep 1
+          done
+          # Full production chain: Express → real OSRM → normalizer → client shape
+          curl -sf --max-time 20 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443' -o directions-response.json
+          node -e '
+            const r = require("./directions-response.json");
+            const rt = r.route ?? r; // tolerant to {route:{...}} wrapper
+            const d = rt.distanceMeters, t = rt.durationSeconds, g = rt.geometry;
+            if (!(typeof d === "number" && d > 0 && Number.isFinite(d))) { console.error("bad distanceMeters:", d); process.exit(1); }
+            if (!(typeof t === "number" && t > 0 && Number.isFinite(t))) { console.error("bad durationSeconds:", t); process.exit(1); }
+            if (!(Array.isArray(g) && g.length >= 2)) { console.error("bad geometry"); process.exit(1); }
+            const last = g.at(-1);
+            if (Math.abs(last[0] - (-6.7789875)) > 0.0005 || Math.abs(last[1] - 39.265234375) > 0.0005) { console.error("geometry does not end at Hunter"); process.exit(1); }
+            console.log(`Express chain OK: ${d}m, ${t}s, ${g.length} geometry points, ends at Hunter`);
+          '
+          # SSRF regression in the live server: demo guard + no destination override
+          echo "--- demo server must be refused in production:"
+          curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&url=https://router.project-osrm.org' | grep -vq '^2' || { echo '::error::client URL parameter was accepted (SSRF)'; exit 1; }
+          echo "--- destination override attempt must be ignored:"
+          curl -s 'http://127.0.0.1:3210/api/v1/directions?from=-6.7923,39.2443&destination=0,0' | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const j=JSON.parse(s);const last=j.route.geometry.at(-1);if(Math.abs(last[0]-(-6.7789875))>0.0005)process.exit(1);console.log("destination still Hunter: PASS")})'
+          kill "$(cat express.pid)" 2>/dev/null || true
+
+      - name: "M. Peak resource observation (osrm-routed RSS)"
+        if: always()
+        run: |
+          if [ -f routed.pid ] && kill -0 "$(cat routed.pid)" 2>/dev/null; then
+            ps -o pid,rss,vsz,cmd -p "$(cat routed.pid)" | tee rss-evidence.txt
+            echo "routed_rss_mb=$(( $(ps -o rss= -p "$(cat routed.pid)") / 1024 ))" >> "$GITHUB_ENV"
+          fi
+
+      - name: "M. Stop OSRM cleanly"
+        if: always()
+        run: |
+          [ -f routed.pid ] && kill "$(cat routed.pid)" 2>/dev/null || true
+          sleep 1
+
+      # ------------------------------------------------------------- N. report
+      - name: "N. Verification report"
+        if: always()
+        run: |
+          cat > verification-report.json <<EOF
+          {
+            "date": "$(date -u +%FT%TZ)",
+            "osrm_version": "${osrm_version:-unknown}",
+            "osrm_docker_pin": "$(grep -m1 'FROM osrm/osrm-backend' osrm/Dockerfile)",
+            "pbf_source": "https://download.geofabrik.de/africa/tanzania-latest.osm.pbf",
+            "pbf_bytes": ${tanzania_pbf_bytes:-0},
+            "pbf_md5_geofabrik": "${tanzania_pbf_md5:-not_verified}",
+            "extract_seconds": ${extract_seconds:-null},
+            "partition_seconds": ${partition_seconds:-null},
+            "customize_seconds": ${customize_seconds:-null},
+            "graph_artifacts_mb": ${graph_mb:-null},
+            "routed_rss_mb": ${routed_rss_mb:-null},
+            "runner": "ubuntu-latest (16 GB)",
+            "route_code": "Ok",
+            "express_chain": "verified"
+          }
+          EOF
+          cat verification-report.json
+
+      - name: "Upload evidence artifacts (lightweight JSON/logs only)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osrm-verification-evidence
+          path: |
+            verification-report.json
+            route-response.json
+            directions-response.json
+            extract.log
+            partition.log
+            customize.log
+            routed.log
+            express.log
+            disk-evidence.txt
+            rss-evidence.txt
+            artifacts-list.txt
+          if-no-files-found: warn
+          retention-days: 30

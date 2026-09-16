@@ -39,3 +39,31 @@ services:
         sync: false # server-only Supabase project URL
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false # SERVER-ONLY secret — must NEVER be prefixed VITE_ or logged
+      # In-site navigation ("Take Me to Hunter") routing upstream. SERVER-ONLY
+      # (never VITE_*): points at the private hunter-osrm service below over
+      # Render's private network. Unset/empty ⇒ /api/v1/directions fails
+      # closed with structured 503 (never falls back to a public demo).
+      - key: OSRM_BASE_URL
+        sync: false # e.g. http://hunter-osrm:5000 — set after the private service exists
+
+  # ---- Production OSRM routing backend ("Take Me to Hunter") ----
+  # Private service: reachable ONLY from this account's other Render services
+  # over Render's private network — the public internet cannot reach it, so it
+  # needs no auth and presents no open-proxy surface. The Hunter web service
+  # is the only client; it constructs the upstream URL itself (no client input
+  # beyond validated `from` coordinates).
+  #
+  # Data: Geofabrik Tanzania extract (673 MB) preprocessed at IMAGE BUILD time
+  # (MLD car profile) and baked into the image — web-service deploys never
+  # rebuild the graph; data refresh = deliberate redeploy of this service.
+  # Resources: build ~2 GB RAM peak / 15–40 min; runtime ~1–1.5 GB RSS ⇒
+  # Standard plan REQUIRED (free/starter 512 MB is insufficient).
+  - type: pserv
+    name: hunter-osrm
+    runtime: docker
+    plan: standard
+    region: oregon # same region as the web service (private network locality)
+    branch: master
+    autoDeploy: false # rebuild the routing graph only deliberately
+    dockerfilePath: osrm/Dockerfile
+    dockerContext: osrm

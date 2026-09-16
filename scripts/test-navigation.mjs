@@ -126,6 +126,49 @@ test('directions: upstream rejects never return raw provider data', async () => 
   }
 });
 
+test('directions: oversized upstream body rejected (response-size protection)', async () => {
+  // Streaming body that exceeds the 5 MB cap — must be cut off, not buffered.
+  const bigChunk = new Uint8Array(3 * 1024 * 1024).fill(0x61); // 3 MB of 'a'
+  let reads = 0;
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => {
+          reads++;
+          return { done: false, value: bigChunk };
+        },
+        cancel: async () => { reads = -1; },
+      }),
+    },
+    json: async () => { throw new Error('unbounded json() must not be used'); },
+  });
+  const res = await fetchDirections({ lat: -6.0, lng: 39.0 }, { OSRM_BASE_URL: 'https://osrm.example.com' }, fetchImpl);
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.equal(res.code, 'ROUTE_UNAVAILABLE');
+    assert.equal(res.httpStatus, 502);
+  }
+  assert.equal(reads, -1, 'stream was cancelled after exceeding the cap');
+});
+
+test('directions: unparseable upstream body → structured ROUTE_UNAVAILABLE', async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => ({ done: true, value: undefined }),
+        cancel: async () => {},
+      }),
+    },
+  });
+  const res = await fetchDirections({ lat: -6.0, lng: 39.0 }, { OSRM_BASE_URL: 'https://osrm.example.com' }, fetchImpl);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.equal(res.code, 'ROUTE_UNAVAILABLE');
+});
+
 test('directions: malformed upstream payload → structured ROUTE_UNAVAILABLE', async () => {
   const fetchImpl = async () => ({
     ok: true,
