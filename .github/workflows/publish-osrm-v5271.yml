@@ -253,29 +253,49 @@ jobs:
 
       - name: "Pulled image passes the SAME graph + runtime + route gates (§16)"
         run: |
-          set -o pipefail
-          docker run --rm --entrypoint sh "${IMAGE_NAME}@${IMAGE_DIGEST}" -c '
-            test -s /data/tanzania-latest.osrm || { echo "graph missing in pulled image"; exit 1; }
-            test -s /data/tanzania-latest.osrm.mldgr || { echo "MLD graph missing in pulled image"; exit 1; }
-            echo "pulled-image graph content: PASS"
-          ' | tee graph-content-pulled.txt
-          docker run -d --name hunter-osrm-pulled --network host -e PORT=5000 "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          # §16: verify the REGISTRY artifact the way production runs it — a
+          # long-running container via the image's real entrypoint, readiness-
+          # gated, with filesystem checks executed INSIDE that container via
+          # docker exec (same rootfs as the serving process). Run 35204723631
+          # showed a one-shot `docker run --rm` on a just-recreated digest ref
+          # can observe an unpopulated snapshot (empty /data) even though the
+          # registry artifact is complete (manifest + config + layer digests
+          # verified) — so the readiness loop is the gate, not a pre-flight
+          # one-shot check.
+          CID=hunter-osrm-pulled
+          docker rm -f "$CID" 2>/dev/null || true
+          docker run -d --name "$CID" --network host -e PORT=5000 "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          READY=""
           for i in $(seq 1 90); do
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
               'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
-            if [ "$code" = "200" ]; then echo "pulled image OSRM ready after ~$((i * 2))s"; break; fi
-            running=$(docker inspect -f '{{.State.Running}}' hunter-osrm-pulled 2>/dev/null || echo 'false')
+            if [ "$code" = "200" ]; then READY=$((i * 2)); echo "pulled image OSRM ready after ~${READY}s"; break; fi
+            running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null || echo 'false')
             if [ "$running" != 'true' ]; then
-              echo '::error::PULLED image container exited during startup'
-              docker logs --tail 40 hunter-osrm-pulled 2>&1 | tee routed-pulled.log || true
+              echo '::error::PULLED image container exited during startup (graph load failure)'
+              docker logs --tail 40 "$CID" 2>&1 | tee routed-pulled.log || true
               exit 1
             fi
             sleep 2
           done
-          [ "$code" = "200" ] || { echo '::error::pulled image never became ready'; docker logs --tail 40 hunter-osrm-pulled 2>&1 | tee routed-pulled.log; exit 1; }
+          [ -n "$READY" ] || { echo '::error::pulled image never became ready (180s)'; docker logs --tail 40 "$CID" 2>&1 | tee routed-pulled.log; exit 1; }
+          # Graph content verified INSIDE the running, readiness-proven container.
+          docker exec "$CID" sh -c '
+            ls -lh /data
+            test -s /data/tanzania-latest.osrm || { echo "graph missing in pulled image"; exit 1; }
+            test -s /data/tanzania-latest.osrm.mldgr || { echo "MLD graph missing in pulled image"; exit 1; }
+            echo "pulled-image graph content: PASS"
+          ' | tee graph-content-pulled.txt
+          # Container must KEEP running after readiness — stability, not a fluke.
+          sleep 3
+          running=$(docker inspect -f '{{.State.Running}}' "$CID")
+          [ "$running" = 'true' ] || { echo '::error::pulled-image container died after readiness'; exit 1; }
+          T0=$(date +%s%N)
           curl -sf --max-time 20 \
             'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
             -o route-response-pulled.json
+          T1=$(date +%s%N)
+          echo "PULLED_ROUTE_LATENCY_MS=$(( (T1 - T0) / 1000000 ))" >> "$GITHUB_ENV"
           node -e '
             const r = require("./route-response-pulled.json");
             const rt = r.routes?.[0];
@@ -284,7 +304,9 @@ jobs:
             if (Math.abs(last[1] - (-6.7789875)) > 0.0005 || Math.abs(last[0] - 39.265234375) > 0.0005) { console.error("pulled-image route does not end at Hunter"); process.exit(1); }
             console.log(`pulled-image route: PASS distance=${rt.distance}m duration=${rt.duration}s`);
           '
-          docker rm -f hunter-osrm-pulled 2>/dev/null || true
+          RSS=$(docker stats --no-stream --format '{{.MemUsage}}' "$CID")
+          echo "pulled-image osrm-routed memory: $RSS" | tee rss-pulled.txt
+          docker rm -f "$CID" 2>/dev/null || true
 
       - name: "Upload evidence (lightweight logs/JSON only — no PBF, no graph)"
         if: always()
@@ -302,6 +324,7 @@ jobs:
             graph-content-pulled.txt
             route-response.json
             route-response-pulled.json
+            rss-pulled.txt
             routed-startup.log
             build.log
             push.log
