@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Hunter Autoworks — production OSRM routing service (Tanzania extract)
+# PHASE 3B.3 — OSRM v5.27.1 multi-arch re-certification artifact.
+#
+# SEPARATE from the certified osrm/Dockerfile (v5.25.0) BY DESIGN: the Phase
+# 3B.1 certification chain must stay byte-intact, so this version bump lives in
+# its own Dockerfile with its own immutable GHCR tags and its own publish
+# workflow (.github/workflows/publish-osrm-v5271.yml). Nothing here modifies
+# the certified v5.25.0 artifact or its pipeline.
+#
+# DATA PREPARATION HAPPENS AT IMAGE-BUILD TIME, so the routing graph is baked
+# into the image: a redeploy of the Hunter WEB SERVICE never rebuilds the
+# graph. Rebuilding happens ONLY when this image is rebuilt (deliberate data
+# refresh — see osrm/README.md).
+#
+# Each preprocessing command is a separate RUN so a build failure is
+# attributable to exactly one stage (extract / partition / customize) and
+# each layer's data footprint is printed for the resource-evidence record.
+#
+# Base image pinned to an immutable upstream GHCR tag (verified multi-arch,
+# 2026-09-17): ghcr.io/project-osrm/osrm-backend:v5.27.1 — OCI index resolving
+# to linux/amd64 AND linux/arm64 (per-arch config blobs proven
+# architecture=arm64/amd64, os=linux; binaries verified ELF AArch64/x86-64).
+# Project-OSRM does not publish v5.27.1 on Docker Hub (404) and stopped
+# updating osrm/osrm-backend after v5.25.0 — GHCR is the current official
+# upstream registry. Do NOT use `latest`.
+# =============================================================================
+
+FROM ghcr.io/project-osrm/osrm-backend:v5.27.1 AS prep
+
+# Pin the extract by URL; Geofabrik updates this file daily. The build ARG
+# allows rebuilding against the same or a refreshed extract deterministically.
+ARG PBF_URL=https://download.geofabrik.de/africa/tanzania-latest.osm.pbf
+ENV PBF_URL=${PBF_URL}
+
+WORKDIR /data
+# CANONICAL PBF FILENAME — matches .github/workflows/verify-osrm.yml so the
+# CI pipeline and the image build use identical naming end-to-end (download
+# target = checksum target = osrm-extract input; osrm tooling derives the
+# graph stem from the input filename).
+ADD ${PBF_URL} /data/tanzania-latest.osm.pbf
+
+# Car profile (passenger-car road navigation) ships inside the image at
+# /opt/car.lua. MLD pipeline: extract → partition → customize.
+RUN osrm-extract -p /opt/car.lua /data/tanzania-latest.osm.pbf \
+ && echo "after osrm-extract:" && du -sh /data
+
+RUN osrm-partition /data/tanzania-latest.osrm \
+ && echo "after osrm-partition:" && du -sh /data
+
+RUN osrm-customize /data/tanzania-latest.osrm \
+ && echo "after osrm-customize:" && du -sh /data \
+ && rm -f /data/tanzania-latest.osm.pbf \
+ && echo "final graph artifacts:" && ls -lh /data
+
+FROM ghcr.io/project-osrm/osrm-backend:v5.27.1
+
+WORKDIR /data
+COPY --from=prep /data /data
+
+EXPOSE 5000
+# osrm-routed serves /route, /nearest, /table, ... Honor the host platform's
+# PORT env (Render private services are reached at <name>:<port>); defaults
+# to 5000 locally. The runtime STARTS DIRECTLY from the prepared graph — no
+# preprocessing at container start. No arbitrary-params hardening is needed
+# here: the Hunter Express server is the ONLY permitted client, and it
+# constructs the upstream URL itself from a validated, fixed shape.
+ENTRYPOINT ["sh", "-c", "exec osrm-routed --algorithm mld --max-table-size 100 --port ${PORT:-5000} /data/tanzania-latest.osrm"]

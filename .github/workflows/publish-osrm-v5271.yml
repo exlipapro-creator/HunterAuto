@@ -1,0 +1,317 @@
+# PHASE 3B.3 — OSRM v5.27.1 multi-arch (arm64 + amd64) production image
+# publication. Manual dispatch ONLY; nothing auto-runs.
+#
+# SEPARATE from publish-osrm.yml (the certified v5.25.0 pipeline) BY DESIGN:
+# that pipeline, its Dockerfile (osrm/Dockerfile), and its immutable tags are
+# untouched. This workflow builds osrm/Dockerfile.v5.27.1 and publishes
+# architecture-specific immutable tags:
+#   ghcr.io/<owner>/hunter-osrm:v5.27.1-tanzania-<sha7>-arm64
+#   ghcr.io/<owner>/hunter-osrm:v5.27.1-tanzania-<sha7>-amd64
+# The certified v5.25.0 tags are never overwritten. No `latest`.
+#
+# Runner strategy: the repository is PUBLIC, so GitHub-hosted arm64 runners
+# (ubuntu-24.04-arm, 4 vCPU / 16 GB) are free for public repos — a native
+# arm64 build, not emulation (§9/§10). amd64 uses ubuntu-latest (16 GB),
+# matching the certified 3B.1 environment for a clean cross-arch comparison.
+#
+# Safety: push happens ONLY after every build, content, and runtime gate
+# passes; the pushed artifact is then pulled back BY DIGEST and re-verified
+# (§16). Secrets: only the workflow's own GITHUB_TOKEN (packages: write).
+
+name: publish-osrm-v5271
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-osrm-v5271
+  cancel-in-progress: false
+
+jobs:
+  build-arch:
+    name: "Build + gate + publish (${{ matrix.arch }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-latest
+    steps:
+      - name: "A. Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Env facts + determinism inputs"
+        run: |
+          echo "runner: $(uname -m), $(nproc) vCPU"
+          free -h | head -2
+          df -h / | tail -1 | tee disk-evidence.txt
+          echo "SOURCE_COMMIT=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGE_NAME=ghcr.io/${OWNER_LC}/hunter-osrm" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=v5.27.1-tanzania-${GITHUB_SHA::7}-${{ matrix.arch }}" >> "$GITHUB_ENV"
+          echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
+
+      - name: "Pre-flight: pin must be exactly the v5.27.1 upstream GHCR tag (no floating base)"
+        run: |
+          PIN=$(grep -m1 '^FROM ghcr.io/project-osrm/osrm-backend:' osrm/Dockerfile.v5.27.1 | awk '{print $2}')
+          N=$(grep -c '^FROM ghcr.io/project-osrm/osrm-backend:' osrm/Dockerfile.v5.27.1)
+          echo "pinned base: $PIN (stages: $N)"
+          [ "$N" = "2" ] || { echo '::error::Dockerfile stage count changed — review before publishing'; exit 1; }
+          if echo "$PIN" | grep -q ':latest'; then echo '::error::floating base tag forbidden'; exit 1; fi
+          case "$PIN" in ghcr.io/project-osrm/osrm-backend:v5.27.1) ;; *) echo '::error::base pin is not the certified v5.27.1 upstream tag'; exit 1;; esac
+          grep -q '/opt/car.lua' osrm/Dockerfile.v5.27.1 || { echo '::error::car profile path missing'; exit 1; }
+          grep -q -- '--algorithm mld' osrm/Dockerfile.v5.27.1 || { echo '::error::MLD runtime flag missing'; exit 1; }
+
+      - name: "Build the v5.27.1 image (native ${{ matrix.arch }} — graph baked in)"
+        run: |
+          START=$(date +%s)
+          docker build --progress=plain -f osrm/Dockerfile.v5.27.1 -t "${IMAGE_NAME}:${IMAGE_TAG}" osrm/ > build-full.log 2>&1 \
+            || { echo '::error::docker build failed'; tail -60 build-full.log; exit 1; }
+          END=$(date +%s)
+          echo "BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          tail -c 200000 build-full.log > build.log
+          grep -E "after (osrm-extract|osrm-partition|osrm-customize)|final graph artifacts" build-full.log | tee stage-footprints.txt || true
+          docker image ls "${IMAGE_NAME}" --format 'built: {{.Repository}}:{{.Tag}} {{.Size}}'
+          df -h / | tail -1 >> disk-evidence.txt
+
+      - name: "Image inspect — architecture identity (§10)"
+        run: |
+          docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" > image-inspect-local.json
+          EXPECTED_ARCH=${{ matrix.arch }}
+          node -e '
+            const i = require("./image-inspect-local.json")[0];
+            const want = process.env.EXPECTED_ARCH;
+            const okArch = i.Architecture === want && i.Os === "linux";
+            const okPort = !!(i.Config.ExposedPorts && i.Config.ExposedPorts["5000/tcp"]);
+            const okEp = Array.isArray(i.Config.Entrypoint) && i.Config.Entrypoint.length > 0;
+            console.log(`id=${i.Id} size=${(i.Size/1073741824).toFixed(2)}GiB arch=${i.Architecture}/${i.Os} port5000=${okPort} entrypoint=${okEp}`);
+            if (!okArch || !okPort || !okEp) process.exit(1);
+          '
+          ID=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{.Id}}')
+          SIZE_MB=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{.Size}}' | awk '{printf "%d", $1/1048576}')
+          echo "IMAGE_ID=${ID}" >> "$GITHUB_ENV"
+          echo "SIZE_MB=${SIZE_MB}" >> "$GITHUB_ENV"
+
+      - name: "OSRM version verified INSIDE the image (must be 5.27.1)"
+        run: |
+          # --entrypoint is REQUIRED: the image entrypoint is osrm-routed; without
+          # this override the command would be ignored and routed would start.
+          docker run --rm --entrypoint osrm-extract "${IMAGE_NAME}:${IMAGE_TAG}" --version 2>&1 | head -1 | tee osrm-version.txt
+          grep -q "5\.27\.1" osrm-version.txt || { echo '::error::in-image OSRM version is not 5.27.1'; exit 1; }
+
+      - name: "Binary architecture proof INSIDE the image (§10 — ELF header, not just labels)"
+        run: |
+          docker run --rm --entrypoint sh "${IMAGE_NAME}:${IMAGE_TAG}" -c '
+            for b in /usr/local/bin/osrm-routed /usr/local/bin/osrm-extract; do
+              echo "--- $b"
+              head -c 20 "$b" | od -A x -t x1 | head -2
+              # e_machine lives at ELF offset 18-19 (little-endian)
+              M=$(head -c 20 "$b" | od -A n -t x1 | tr -d " \n" | cut -c37-40)
+              echo "e_machine bytes: $M"
+            done
+          ' | tee binarch.txt
+          # 0xb7 = 183 = AArch64; 0x3e = 62 = x86-64. Bytes appear reversed in od output per word.
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            grep -q "e_machine bytes: b700" binarch.txt || { echo '::error::osrm binaries are not AArch64'; exit 1; }
+          else
+            grep -q "e_machine bytes: 3e00" binarch.txt || { echo '::error::osrm binaries are not x86-64'; exit 1; }
+          fi
+
+      - name: "Graph content verification — artifact set DERIVED from the actual v5.27.1 toolchain (§11)"
+        run: |
+          set -o pipefail
+          # Do NOT copy the v5.25.0 expected-file list (that exact mistake caused
+          # a false gate failure in 3B.1). Instead: run the REAL v5.27.1 pipeline
+          # on a tiny synthetic OSM extract, record which artifacts it produces,
+          # then require the production graph to contain that full set (plus
+          # plausible size gates). Also: PBF must be absent from the runtime image.
+          mkdir -p derive && cd derive
+          cat > mini.osm <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <osm version="0.6">
+           <node id="1" lat="-6.7920" lon="39.2440"/>
+           <node id="2" lat="-6.7921" lon="39.2445"/>
+           <node id="3" lat="-6.7922" lon="39.2450"/>
+           <node id="4" lat="-6.7923" lon="39.2455"/>
+           <way id="10">
+            <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/>
+            <tag k="highway" v="primary"/><tag k="name" v="Test Road"/><tag k="maxspeed" v="50"/>
+           </way>
+          </osm>
+          EOF
+          docker run --rm --entrypoint sh -v "$PWD:/data" -w /data "${IMAGE_NAME}:${IMAGE_TAG}" \
+            -c 'osrm-extract -p /opt/car.lua /data/mini.osm >/dev/null 2>&1 && osrm-partition /data/mini.osrm >/dev/null 2>&1 && osrm-customize /data/mini.osrm >/dev/null 2>&1; ls /data/mini.osrm*' \
+            | sed 's/mini\.osrm/GRAPH/' | sort -u > derived-artifacts.txt
+          cat derived-artifacts.txt
+          cd ..
+          docker run --rm --entrypoint sh "${IMAGE_NAME}:${IMAGE_TAG}" -c 'ls /data' | sort -u > actual-graph-files.txt
+          MISSING=0
+          while read -r A; do
+            PATTERN=$(echo "$A" | sed 's/GRAPH/tanzania-latest.osrm/')
+            grep -qx "$PATTERN" actual-graph-files.txt || { echo "MISSING derived artifact: $PATTERN"; MISSING=1; }
+          done < derive/derived-artifacts.txt
+          [ "$MISSING" = "0" ] || exit 1
+          docker run --rm --entrypoint sh "${IMAGE_NAME}:${IMAGE_TAG}" -c '
+            test ! -f /data/tanzania-latest.osm.pbf || { echo "source PBF must not ship in the runtime image"; exit 1; }
+            du -sm /data
+          ' | tee graph-content.txt
+          GRAPH_MB=$(grep -oE '^[0-9]+[[:space:]]+/data$' graph-content.txt | awk '{print $1}')
+          echo "GRAPH_MB=${GRAPH_MB:-0}" >> "$GITHUB_ENV"
+          [ "${GRAPH_MB:-0}" -ge 1000 ] || { echo '::error::graph implausibly small — preprocessing incomplete'; exit 1; }
+
+      - name: "Runtime smoke: start the built image exactly as production will (§12)"
+        run: |
+          START=$(date +%s)
+          docker run -d --name hunter-osrm-v5271 --network host -e PORT=5000 "${IMAGE_NAME}:${IMAGE_TAG}"
+          READY=""
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
+            if [ "$code" = "200" ]; then READY=$(( $(date +%s) - START )); echo "image OSRM ready after ~${READY}s"; break; fi
+            running=$(docker inspect -f '{{.State.Running}}' hunter-osrm-v5271 2>/dev/null || echo 'false')
+            if [ "$running" != 'true' ]; then
+              echo '::error::built image container exited during startup (graph load failure)'
+              docker logs --tail 40 hunter-osrm-v5271 2>&1 | tee routed-build.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+          [ -n "$READY" ] || { echo '::error::built image OSRM never became ready (180s)'; docker logs --tail 40 hunter-osrm-v5271 2>&1 | tee routed-build.log; exit 1; }
+          echo "READY_SECONDS=${READY}" >> "$GITHUB_ENV"
+          docker logs hunter-osrm-v5271 2>&1 | head -30 | tee routed-startup.log
+
+      - name: "REAL Tanzania route against the built image (§13)"
+        run: |
+          curl -sf --max-time 20 \
+            'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
+            -o route-response.json
+          T0=$(date +%s%N)
+          curl -sf --max-time 20 \
+            'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
+            -o /dev/null
+          T1=$(date +%s%N)
+          echo "ROUTE_LATENCY_MS=$(( (T1 - T0) / 1000000 ))" >> "$GITHUB_ENV"
+          node -e '
+            const r = require("./route-response.json");
+            const rt = r.routes?.[0];
+            if (r.code !== "Ok" || !rt) { console.error("no route:", r.code); process.exit(1); }
+            const okD = typeof rt.distance === "number" && rt.distance > 0 && Number.isFinite(rt.distance);
+            const okT = typeof rt.duration === "number" && rt.duration > 0 && Number.isFinite(rt.duration);
+            const okG = Array.isArray(rt.geometry?.coordinates) && rt.geometry.coordinates.length >= 2;
+            console.log(`distance=${rt.distance}m duration=${rt.duration}s points=${rt.geometry.coordinates.length}`);
+            if (!okD || !okT || !okG) { console.error("route validation failed"); process.exit(1); }
+            const last = rt.geometry.coordinates.at(-1);
+            if (Math.abs(last[1] - (-6.7789875)) > 0.0005 || Math.abs(last[0] - 39.265234375) > 0.0005) { console.error("route does not end at Hunter destination"); process.exit(1); }
+            const bad = rt.geometry.coordinates.filter(([lng, lat]) => !(lng > 29.0 && lng < 41.0 && lat > -12 && lat < -0.8));
+            if (bad.length) { console.error("geometry outside Tanzania bbox:", bad.length); process.exit(1); }
+            console.log("built-image route: PASS (ends at Hunter, inside Tanzania)");
+          '
+
+      - name: "RSS observation + stop built-image container (measured, not estimated)"
+        if: always()
+        run: |
+          if docker inspect -f '{{.State.Running}}' hunter-osrm-v5271 2>/dev/null | grep -q true; then
+            USAGE=$(docker stats --no-stream --format '{{.MemUsage}}' hunter-osrm-v5271)
+            echo "built-image osrm-routed memory: $USAGE" | tee rss-evidence.txt
+            NUM=$(echo "$USAGE" | awk '{print $1}' | tr -d ' GiB')
+            UNIT=$(echo "$USAGE" | awk '{print $1}' | grep -o 'GiB\|MiB' || echo 'MiB')
+            case "$UNIT" in GiB) MB=$(awk "BEGIN{printf \"%d\", $NUM * 1024}") ;; *) MB=$(awk "BEGIN{printf \"%d\", $NUM}") ;; esac
+            echo "ROUTED_RSS_MB=${MB}" >> "$GITHUB_ENV"
+          fi
+          docker rm -f hunter-osrm-v5271 2>/dev/null || true
+
+      - name: "Push the exact immutable per-arch tag (GHCR, native GITHUB_TOKEN) (§16)"
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE_NAME}:${IMAGE_TAG}" 2>&1 | tee push.log
+          DIGEST=$(grep -oE 'digest: sha256:[a-f0-9]+' push.log | awk '{print $2}' | head -1)
+          [ -n "$DIGEST" ] || { echo '::error::push produced no digest'; exit 1; }
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+          echo "published: ${IMAGE_NAME}:${IMAGE_TAG}@${DIGEST}"
+
+      - name: "Registry verification: remove local image, pull back BY DIGEST"
+        run: |
+          docker rmi "${IMAGE_NAME}:${IMAGE_TAG}" || true
+          docker pull "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          docker image inspect "${IMAGE_NAME}@${IMAGE_DIGEST}" > image-inspect-pulled.json
+          echo "pulled-by-digest: $(docker image inspect "${IMAGE_NAME}@${IMAGE_DIGEST}" --format '{{.Id}}')"
+
+      - name: "Pulled image passes the SAME graph + runtime + route gates (§16)"
+        run: |
+          set -o pipefail
+          docker run --rm --entrypoint sh "${IMAGE_NAME}@${IMAGE_DIGEST}" -c '
+            test -s /data/tanzania-latest.osrm || { echo "graph missing in pulled image"; exit 1; }
+            test -s /data/tanzania-latest.osrm.mldgr || { echo "MLD graph missing in pulled image"; exit 1; }
+            echo "pulled-image graph content: PASS"
+          ' | tee graph-content-pulled.txt
+          docker run -d --name hunter-osrm-pulled --network host -e PORT=5000 "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
+            if [ "$code" = "200" ]; then echo "pulled image OSRM ready after ~$((i * 2))s"; break; fi
+            running=$(docker inspect -f '{{.State.Running}}' hunter-osrm-pulled 2>/dev/null || echo 'false')
+            if [ "$running" != 'true' ]; then
+              echo '::error::PULLED image container exited during startup'
+              docker logs --tail 40 hunter-osrm-pulled 2>&1 | tee routed-pulled.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+          [ "$code" = "200" ] || { echo '::error::pulled image never became ready'; docker logs --tail 40 hunter-osrm-pulled 2>&1 | tee routed-pulled.log; exit 1; }
+          curl -sf --max-time 20 \
+            'http://127.0.0.1:5000/route/v1/driving/39.2443,-6.7923;39.265234375,-6.7789875?overview=simplified&geometries=geojson&alternatives=false&steps=false' \
+            -o route-response-pulled.json
+          node -e '
+            const r = require("./route-response-pulled.json");
+            const rt = r.routes?.[0];
+            if (r.code !== "Ok" || !rt || !(rt.distance > 0) || !(rt.duration > 0) || !(rt.geometry?.coordinates?.length >= 2)) { console.error("pulled-image route invalid"); process.exit(1); }
+            const last = rt.geometry.coordinates.at(-1);
+            if (Math.abs(last[1] - (-6.7789875)) > 0.0005 || Math.abs(last[0] - 39.265234375) > 0.0005) { console.error("pulled-image route does not end at Hunter"); process.exit(1); }
+            console.log(`pulled-image route: PASS distance=${rt.distance}m duration=${rt.duration}s`);
+          '
+          docker rm -f hunter-osrm-pulled 2>/dev/null || true
+
+      - name: "Upload evidence (lightweight logs/JSON only — no PBF, no graph)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osrm-v5271-${{ matrix.arch }}-evidence
+          path: |
+            osrm-version.txt
+            image-inspect-local.json
+            image-inspect-pulled.json
+            binarch.txt
+            derived-artifacts.txt
+            actual-graph-files.txt
+            graph-content.txt
+            graph-content-pulled.txt
+            route-response.json
+            route-response-pulled.json
+            routed-startup.log
+            build.log
+            push.log
+            rss-evidence.txt
+            disk-evidence.txt
+            stage-footprints.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    name: "Publication report"
+    needs: build-arch
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: "Summarize publication"
+        run: |
+          echo "Both architecture jobs must be green before this report matters."
+          echo "See per-arch artifacts: osrm-v5271-arm64-evidence / osrm-v5271-amd64-evidence"
+          echo "Tags: ghcr.io/${GITHUB_REPOSITORY_OWNER}/hunter-osrm:v5.27.1-tanzania-${GITHUB_SHA::7}-{arm64,amd64}"
