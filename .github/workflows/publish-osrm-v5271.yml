@@ -158,8 +158,11 @@ jobs:
           cd ..
           docker run --rm --entrypoint sh "${IMAGE_NAME}:${IMAGE_TAG}" -c 'ls /data' | sort -u > actual-graph-files.txt
           MISSING=0
+          # derive listing carries full paths (/data/GRAPH.x) while the actual
+          # image listing is bare filenames — normalize to basenames before
+          # exact-line comparison (run 35203550111 false-missed every artifact).
           while read -r A; do
-            PATTERN=$(echo "$A" | sed 's/GRAPH/tanzania-latest.osrm/')
+            PATTERN=$(echo "$A" | sed 's|^/data/||; s/GRAPH/tanzania-latest.osrm/')
             grep -qx "$PATTERN" actual-graph-files.txt || { echo "MISSING derived artifact: $PATTERN"; MISSING=1; }
           done < derive/derived-artifacts.txt
           [ "$MISSING" = "0" ] || exit 1
