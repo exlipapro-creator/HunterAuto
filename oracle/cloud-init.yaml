@@ -1,0 +1,174 @@
+# =============================================================================
+# Hunter Autoworks — OSRM Always Free activation kit (Phase 3B.4)
+# =============================================================================
+# cloud-init user-data for the Oracle A1.Flex ARM64 instance (Ubuntu, Always
+# Free-eligible). Paste this file's contents into the "Add cloud-init user
+# data" field when creating the instance.
+#
+# WHAT IT DOES (idempotent; safe to re-run via cloud-init per-boot):
+#  1. Installs Docker + nginx + certbot from Ubuntu archives.
+#  2. Pulls the CERTIFIED digest-pinned arm64 OSRM artifact from GHCR
+#     (anonymous — the artifact is public).
+#  3. Runs OSRM bound to 127.0.0.1 ONLY (docker -p 127.0.0.1:5000:5000) with
+#     the image's own production entrypoint, restart=unless-stopped, and a
+#     systemd unit that guarantees startup after host reboot.
+#  4. Installs the hardened nginx boundary (oracle/nginx-hunter-osrm.conf)
+#     with placeholder TLS paths; the owner runs certbot once to get real
+#     certs for the actual DNS hostname (never invent DNS names).
+#  5. Applies ufw: SSH limited to the boot-time value of ADMIN_CIDR (set the
+#     owner's current IP range in the instance metadata/variable below),
+#     443 open, 80 for ACME only. Port 5000 is NOT opened anywhere.
+#
+# SECURITY NOTES:
+#  - No secrets are embedded. The image is public; nothing else is needed.
+#  - The certified digest below is the identity anchor — never replace it
+#    with :latest or a mutable tag.
+#  - After first boot, verify with: bash oracle/verify.sh (from the repo,
+#    run remotely or copied onto the host).
+# =============================================================================
+
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - nginx
+  - certbot
+  - python3-certbot-nginx
+  - ufw
+
+write_files:
+  # ---- 1. The OSRM runtime unit (reboot-safe) --------------------------------
+  - path: /etc/systemd/system/hunter-osrm.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Hunter OSRM (certified v5.27.1 arm64, digest-pinned)
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStartPre=/usr/bin/docker pull ghcr.io/exlipapro-creator/hunter-osrm@sha256:4ef4b3641e69060ada459bfef9bb8c1b93157a36ce7d6a4499a0f8cb7cf739d3
+      ExecStartPre=-/usr/bin/docker rm -f hunter-osrm
+      ExecStart=/usr/bin/docker run -d --name hunter-osrm \
+        --restart unless-stopped \
+        -p 127.0.0.1:5000:5000 \
+        -e PORT=5000 \
+        ghcr.io/exlipapro-creator/hunter-osrm@sha256:4ef4b3641e69060ada459bfef9bb8c1b93157a36ce7d6a4499a0f8cb7cf739d3
+      ExecStop=/usr/bin/docker rm -f hunter-osrm
+      TimeoutStartSec=600
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ---- 2. The hardened public boundary ---------------------------------------
+  - path: /etc/nginx/sites-available/hunter-osrm.conf
+    permissions: "0644"
+    content: |
+      # Content = oracle/nginx-hunter-osrm.conf (kept in sync by the kit).
+      # Placeholder TLS paths until certbot issues real certificates.
+      limit_req_zone $binary_remote_addr zone=osrm_route:10m rate=10r/s;
+
+      server {
+          listen 80;
+          server_name _;
+          location /.well-known/acme-challenge/ { root /var/www/html; }
+          location / { return 301 https://$host$request_uri; }
+      }
+
+      server {
+          listen 443 ssl;
+          http2 on;
+          server_name _;
+
+          ssl_certificate     /etc/letsencrypt/live/PLACEHOLDER/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/PLACEHOLDER/privkey.pem;
+          ssl_protocols TLSv1.2 TLSv1.3;
+
+          server_tokens off;
+          add_header Strict-Transport-Security "max-age=15552000" always;
+          add_header X-Content-Type-Options "nosniff" always;
+          add_header Referrer-Policy "no-referrer" always;
+
+          client_max_body_size 16k;
+          large_client_header_buffers 2 4k;
+
+          location /route/v1/driving/ {
+              limit_req zone=osrm_route burst=20 nodelay;
+              limit_req_status 429;
+              if ($request_method != GET) { return 405; }
+
+              proxy_pass http://127.0.0.1:5000;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header Connection "";
+              proxy_connect_timeout 3s;
+              proxy_send_timeout 7s;
+              proxy_read_timeout 7s;
+              proxy_buffering off;
+          }
+
+          location / { return 404; }
+
+          access_log /var/log/nginx/hunter-osrm-access.log
+              '$remote_addr [$time_local] "$request_method $uri" $status rt=$request_time';
+          error_log /var/log/nginx/hunter-osrm-error.log warn;
+      }
+
+  # ---- 2b. Bootstrap config: port 80 ONLY, so certbot's HTTP-01 challenge
+  #      works BEFORE real certificates exist (nginx cannot start with the
+  #      full 443 config until certs are issued — chicken/egg resolved by
+  #      oracle/activate-tls.sh switching configs after issuance).
+  - path: /etc/nginx/sites-enabled/hunter-osrm-bootstrap.conf
+    permissions: "0644"
+    content: |
+      server {
+          listen 80 default_server;
+          server_name _;
+          location /.well-known/acme-challenge/ { root /var/www/html; }
+          location / { return 301 https://$host$request_uri; }
+      }
+
+  # ---- 3. ufw bootstrap: 443 public, 80 ACME, SSH admin-only, 5000 NEVER ------
+  - path: /usr/local/sbin/hunter-firewall.sh
+    permissions: "0700"
+    content: |
+      #!/usr/bin/env bash
+      # ADMIN_CIDR: set to the owner's current public IP range at instance
+      # creation (cloud-init instance attribute or edit before first boot).
+      # Format example: 203.0.113.4/32
+      ADMIN_CIDR="${ADMIN_CIDR:-CHANGEME_ADMIN_CIDR}"
+      if [ "$ADMIN_CIDR" = "CHANGEME_ADMIN_CIDR" ]; then
+        echo "hunter-firewall: ADMIN_CIDR not set — SSH left closed. Set it and re-run." >&2
+      fi
+      ufw --force reset >/dev/null
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow 443/tcp comment 'hunter-osrm public HTTPS'
+      ufw allow 80/tcp  comment 'ACME challenge only'
+      if [ "$ADMIN_CIDR" != "CHANGEME_ADMIN_CIDR" ]; then
+        ufw allow from "$ADMIN_CIDR" to any port 22 proto tcp comment 'SSH admin (owner IP)'
+      fi
+      ufw --force enable
+      # NOTE: OCI Security List is the outer boundary and is configured in the
+      # Oracle console (see artifacts/operations/PHASE-3B.4-*.md §Runbook):
+      # ingress 443 + 80 from 0.0.0.0/0, ingress 22 from ADMIN_CIDR only.
+
+runcmd:
+  # OSRM runtime: digest-pinned, localhost-only publish, reboot-safe unit
+  - systemctl daemon-reload
+  - systemctl enable --now hunter-osrm.service
+  # nginx boundary: bootstrap config (port 80 only) is already in
+  # sites-enabled via write_files; the full 443 site stays DISABLED in
+  # sites-available until oracle/activate-tls.sh runs after cert issuance.
+  - rm -f /etc/nginx/sites-enabled/default
+  - systemctl enable --now nginx
+  # firewall bootstrap (SSH stays closed until ADMIN_CIDR provided)
+  - bash /usr/local/sbin/hunter-firewall.sh || true
+  # activation-status marker for the verification battery
+  - echo "hunter-osrm cloud-init complete $(date -u +%FT%TZ)" > /var/log/hunter-osrm-init.log
