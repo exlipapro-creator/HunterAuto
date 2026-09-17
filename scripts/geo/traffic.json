@@ -1,0 +1,94 @@
+{
+  "version": 0.6,
+  "generator": "Overpass API 0.7.62.11 87bfad18",
+  "osm3s": {
+    "timestamp_osm_base": "2026-09-17T14:06:05Z",
+    "copyright": "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."
+  },
+  "elements": [
+
+{
+  "type": "node",
+  "id": 252496835,
+  "lat": -6.7901582,
+  "lon": 39.2635345,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 252496840,
+  "lat": -6.7771360,
+  "lon": 39.2637000,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 282836097,
+  "lat": -6.7772795,
+  "lon": 39.2636813,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 282890751,
+  "lat": -6.7771409,
+  "lon": 39.2638796,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 282890755,
+  "lat": -6.7772672,
+  "lon": 39.2638744,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 282890773,
+  "lat": -6.7901512,
+  "lon": 39.2637125,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 4696384101,
+  "lat": -6.7816745,
+  "lon": 39.2636902,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 4818413004,
+  "lat": -6.7921912,
+  "lon": 39.2640669,
+  "tags": {
+    "highway": "traffic_signals"
+  }
+},
+{
+  "type": "node",
+  "id": 12237610541,
+  "lat": -6.7819707,
+  "lon": 39.2804745,
+  "tags": {
+    "highway": "traffic_signals",
+    "traffic_signals": "signal"
+  }
+}
+
+  ]
+}

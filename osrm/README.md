@@ -1,4 +1,4 @@
-# OSRM Routing Backend — Hunter Autoworks ("Take Me to Hunter")
+# OSRM Routing Backend — Hunter Autoworks (/api/v1/directions)
 
 Production routing backend for the in-site navigation feature (commit `8941297`).
 The Hunter Express server remains the **only** browser-facing routing boundary

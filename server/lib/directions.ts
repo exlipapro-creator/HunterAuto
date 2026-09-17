@@ -1,5 +1,5 @@
 /**
- * Server-side directions service for "Take Me to Hunter".
+ * Server-side directions service (/api/v1/directions).
  *
  * Architecture (per the approved audit):
  *  - The browser NEVER contacts a routing provider directly; it calls

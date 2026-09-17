@@ -22,13 +22,13 @@ async function startServer() {
   // (setSession / autoRefreshToken). Blocking it silently breaks staff
   // session persistence. Read from env; no other third-party origins.
   // img-src additionally allows OpenStreetMap raster tiles — the ONLY external
-  // image origin — required by the "Take Me to Hunter" in-site navigation map
-  // (Leaflet). Routing traffic does NOT need connect-src here: route requests
-  // go through our own /api/v1/directions endpoint ('self').
-  // Permissions-Policy: geolocation=(self) — browser Geolocation is enabled
-  // for this origin only (requested exclusively after the customer taps
-  // "Take Me to Hunter"); camera/microphone remain fully disabled and no
-  // other origin is granted geolocation.
+  // image origin — required by the How-to-Reach-Us access map (Leaflet).
+  // Routing traffic does NOT need connect-src here: route requests go through
+  // our own /api/v1/directions endpoint ('self').
+  // Permissions-Policy: geolocation=() — browser Geolocation is fully
+  // disabled: the app is fully passive about location (the How-to-Reach-Us
+  // access map reads no position; customers hand off to Google Maps for
+  // navigation). Camera/microphone likewise fully disabled.
   const isProd = process.env.NODE_ENV === 'production';
   const supabaseOrigin = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '')
     .trim()
@@ -50,7 +50,7 @@ async function startServer() {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(self)');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('Content-Security-Policy', CSP);
     if (isProd) {
       // HSTS only in production: dev runs on plain http://localhost.

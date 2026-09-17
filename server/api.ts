@@ -124,7 +124,7 @@ apiRouter.get('/health', async (_req: Request, res: Response) => {
 });
 
 // ============================================================
-// PUBLIC: in-site navigation ("Take Me to Hunter")
+// PUBLIC: server-side routing for the How-to-Reach-Us location feature
 // ============================================================
 // Thin, fail-closed boundary over the configured OSRM upstream.
 //  - Public (customers navigate without staff auth) but STRICTLY rate-limited:

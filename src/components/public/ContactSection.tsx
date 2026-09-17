@@ -1,6 +1,6 @@
 import React from 'react';
-import { Phone, MessageSquare, MapPin, Clock, ShieldCheck, Navigation } from 'lucide-react';
-import { TakeMeToHunter } from './TakeMeToHunter';
+import { Phone, MessageSquare, MapPin, Clock, Navigation } from 'lucide-react';
+import { HowToReachUs } from './HowToReachUs';
 
 export const ContactSection: React.FC = () => {
   return (
@@ -100,9 +100,11 @@ export const ContactSection: React.FC = () => {
               </span>
             </div>
 
-            {/* In-site live navigation ("Take Me to Hunter") — the Leaflet map
-                code lives in a lazy chunk that loads only on activation. */}
-            <TakeMeToHunter />
+            {/* HOW TO REACH US — the definitive location experience: verified
+                access corridors on a real OSM map plus the single Google Maps
+                navigation handoff. Map code is a lazy chunk that loads only
+                when this block approaches the viewport. */}
+            <HowToReachUs />
 
             {/* Facilities Telemetry */}
             <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-[#132038] text-center font-mono-telemetry text-xs">

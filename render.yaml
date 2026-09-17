@@ -39,14 +39,14 @@ services:
         sync: false # server-only Supabase project URL
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false # SERVER-ONLY secret — must NEVER be prefixed VITE_ or logged
-      # In-site navigation ("Take Me to Hunter") routing upstream. SERVER-ONLY
+      # Server-side routing (/api/v1/directions) upstream. SERVER-ONLY
       # (never VITE_*): points at the private hunter-osrm service below over
       # Render's private network. Unset/empty ⇒ /api/v1/directions fails
       # closed with structured 503 (never falls back to a public demo).
       - key: OSRM_BASE_URL
         sync: false # e.g. http://hunter-osrm:5000 — set after the private service exists
 
-  # ---- Production OSRM routing backend ("Take Me to Hunter") ----
+  # ---- Production OSRM routing backend (/api/v1/directions) ----
   # Private service: reachable ONLY from this account's other Render services
   # over Render's private network — the public internet cannot reach it, so it
   # needs no auth and presents no open-proxy surface. The Hunter web service
