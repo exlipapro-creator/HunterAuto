@@ -1,0 +1,169 @@
+# PHASE 3B.3 — v5.27.1 published-artifact routing matrix verification.
+# Manual dispatch ONLY. Does NOT publish anything: it pulls the ALREADY-
+# PUBLISHED immutable digests (pass them as workflow inputs), runs the
+# representative Tanzania routing matrix on each architecture natively, and
+# cross-compares arch results for semantic invariance.
+#
+# Separate from publish-osrm-v5271.yml (kept untouched — it is the certified
+# publication pipeline). This workflow is the §14/§15 evidence gatherer.
+
+name: verify-osrm-v5271-matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm64_digest:
+        description: "arm64 artifact digest (sha256:...)"
+        required: true
+        type: string
+      amd64_digest:
+        description: "amd64 artifact digest (sha256:...)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: "Routing matrix (${{ matrix.arch }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-latest
+    steps:
+      - name: "Pull the published artifact BY DIGEST (registry identity, not local build)"
+        run: |
+          if [ "${{ matrix.arch }}" = "arm64" ]; then DIGEST="${{ inputs.arm64_digest }}"; else DIGEST="${{ inputs.amd64_digest }}"; fi
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          docker pull "ghcr.io/exlipapro-creator/hunter-osrm@${DIGEST}"
+          docker image inspect "ghcr.io/exlipapro-creator/hunter-osrm@${DIGEST}" > inspect.json
+          node -e '
+            const i = require("./inspect.json")[0];
+            const want = "${{ matrix.arch }}";
+            console.log(`pulled: arch=${i.Architecture}/${i.Os} id=${i.Id}`);
+            if (i.Architecture !== want || i.Os !== "linux") process.exit(1);
+          '
+
+      - name: "Start the real entrypoint and wait for readiness"
+        run: |
+          CID="hunter-osrm-matrix"
+          docker run -d --name "$CID" --network host -e PORT=5000 "ghcr.io/exlipapro-creator/hunter-osrm@${DIGEST}"
+          echo "CID=$CID" >> "$GITHUB_ENV"
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+              'http://127.0.0.1:5000/route/v1/driving/39.24,-6.79;39.2443,-6.7923?overview=false' || true)
+            [ "$code" = "200" ] && { echo "ready after ~$((i * 2))s"; exit 0; }
+            running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null || echo 'false')
+            [ "$running" = 'true' ] || { echo '::error::container exited during startup'; docker logs --tail 40 "$CID"; exit 1; }
+            sleep 2
+          done
+          echo '::error::never became ready'; docker logs --tail 40 "$CID"; exit 1
+
+      - name: "Tanzania routing matrix (real roads, real toolchain)"
+        run: |
+          set -o pipefail
+          probe() { # name fromLng fromLat toLng toLat
+            curl -s --max-time 20 \
+              "http://127.0.0.1:5000/route/v1/driving/$2,$3;$4,$5?overview=simplified&geometries=geojson&alternatives=false&steps=false" \
+              -o "mx-$1.json"
+          }
+          probe kariakoo-hunter 39.2443 -6.7923 39.265234375 -6.7789875   # certified baseline route
+          probe kariakoo-cbd    39.2443 -6.7923 39.2695   -6.8235         # urban, longer (Dar CBD)
+          probe airport-cbd     39.2026 -6.8780 39.2695   -6.8235         # major-road route (JNIA → CBD)
+          probe invalid-coords  999 9999        39.2695   -6.8235         # must NOT yield a route
+          node -e '
+            const fs = require("fs");
+            const BBOX = ([lng, lat]) => lng > 29.0 && lng < 41.0 && lat > -12 && lat < -0.8;
+            const out = {};
+            for (const name of ["kariakoo-hunter", "kariakoo-cbd", "airport-cbd", "invalid-coords"]) {
+              const r = JSON.parse(fs.readFileSync(`mx-${name}.json`, "utf8"));
+              const rt = r.routes?.[0];
+              const last = rt?.geometry?.coordinates?.at(-1);
+              out[name] = {
+                code: r.code,
+                distance: rt?.distance ?? null,
+                duration: rt?.duration ?? null,
+                points: rt?.geometry?.coordinates?.length ?? null,
+                endpoint: last ?? null,
+                allInTanzania: rt?.geometry?.coordinates?.every(BBOX) ?? null,
+              };
+            }
+            fs.writeFileSync("matrix-${{ matrix.arch }}.json", JSON.stringify(out, null, 2));
+            console.log(JSON.stringify(out, null, 2));
+            // Gates: the three real routes must be Ok, plausible, endpoint-correct.
+            for (const [name, dest] of [
+              ["kariakoo-hunter", [39.265234375, -6.7789875]],
+              ["kariakoo-cbd", [39.2695, -6.8235]],
+              ["airport-cbd", [39.2695, -6.8235]],
+            ]) {
+              const m = out[name];
+              if (m.code !== "Ok" || !(m.distance > 0) || !(m.duration > 0) || m.points < 2) {
+                console.error(`matrix fail: ${name} code=${m.code}`); process.exit(1);
+              }
+              if (Math.abs(m.endpoint[0] - dest[0]) > 0.002 || Math.abs(m.endpoint[1] - dest[1]) > 0.002) {
+                console.error(`matrix fail: ${name} endpoint ${m.endpoint}`); process.exit(1);
+              }
+              if (!m.allInTanzania) { console.error(`matrix fail: ${name} geometry left Tanzania bbox`); process.exit(1); }
+            }
+            // The invalid request must NOT be a usable route.
+            if (out["invalid-coords"].code === "Ok") {
+              console.error("matrix fail: invalid coordinates produced a route"); process.exit(1);
+            }
+            console.log("matrix gates: PASS");
+          '
+
+      - name: "RSS + cleanup"
+        if: always()
+        run: |
+          if [ -n "$CID" ] && docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null | grep -q true; then
+            docker stats --no-stream --format '{{.MemUsage}}' "$CID" | tee rss-matrix.txt
+          fi
+          docker rm -f "${CID:-hunter-osrm-matrix}" 2>/dev/null || true
+
+      - name: "Upload matrix evidence"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.arch }}
+          path: |
+            matrix-${{ matrix.arch }}.json
+            rss-matrix.txt
+            inspect.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  compare:
+    name: "Cross-architecture semantic comparison"
+    needs: matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Download both matrix results"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: matrix-*
+          merge-multiple: false
+      - name: "Compare semantic routing fields across architectures"
+        run: |
+          node -e '
+            const arm = require("./matrix-arm64/matrix-arm64.json");
+            const amd = require("./matrix-amd64/matrix-amd64.json");
+            let fail = 0;
+            for (const k of Object.keys(arm)) {
+              const a = arm[k], m = amd[k];
+              const sameCode = a.code === m.code;
+              const distClose = a.distance != null && m.distance != null && Math.abs(a.distance - m.distance) <= 1;
+              const durClose = a.duration != null && m.duration != null && Math.abs(a.duration - m.duration) <= 1;
+              const ptsSame = a.points === m.points;
+              console.log(`${k}: code ${a.code}/${m.code} dist ${a.distance}/${m.distance} dur ${a.duration}/${m.duration} pts ${a.points}/${m.points}`);
+              if (!sameCode || !distClose || !durClose || !ptsSame) { console.error(`  MISMATCH on ${k}`); fail = 1; }
+            }
+            if (fail) process.exit(1);
+            console.log("CROSS-ARCH ROUTING INVARIANCE: PASS (arm64 ≡ amd64 within 1 m / 1 s / 0 pts)");
+          '
