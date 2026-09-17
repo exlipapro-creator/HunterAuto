@@ -158,10 +158,14 @@ jobs:
             for (const k of Object.keys(arm)) {
               const a = arm[k], m = amd[k];
               const sameCode = a.code === m.code;
-              const distClose = a.distance != null && m.distance != null && Math.abs(a.distance - m.distance) <= 1;
-              const durClose = a.duration != null && m.duration != null && Math.abs(a.duration - m.duration) <= 1;
-              const ptsSame = a.points === m.points;
-              console.log(`${k}: code ${a.code}/${m.code} dist ${a.distance}/${m.distance} dur ${a.duration}/${m.duration} pts ${a.points}/${m.points}`);
+              // Both-null means both architectures rejected the request
+              // identically (e.g. InvalidQuery) — that is a MATCH, not a
+              // mismatch (run 35208438883 comparator false-alarmed here).
+              const bothNull = a.distance == null && m.distance == null;
+              const distClose = bothNull || (a.distance != null && m.distance != null && Math.abs(a.distance - m.distance) <= 1);
+              const durClose = bothNull || (a.duration != null && m.duration != null && Math.abs(a.duration - m.duration) <= 1);
+              const ptsSame = bothNull || a.points === m.points;
+              console.log(`${k}: code ${a.code}/${m.code} dist ${a.distance}/${m.distance} dur ${a.duration}/${m.duration} pts ${a.points}/${m.points}${bothNull ? ' (both rejected — match)' : ''}`);
               if (!sameCode || !distClose || !durClose || !ptsSame) { console.error(`  MISMATCH on ${k}`); fail = 1; }
             }
             if (fail) process.exit(1);
