@@ -165,7 +165,7 @@ jobs:
               const distClose = bothNull || (a.distance != null && m.distance != null && Math.abs(a.distance - m.distance) <= 1);
               const durClose = bothNull || (a.duration != null && m.duration != null && Math.abs(a.duration - m.duration) <= 1);
               const ptsSame = bothNull || a.points === m.points;
-              console.log(`${k}: code ${a.code}/${m.code} dist ${a.distance}/${m.distance} dur ${a.duration}/${m.duration} pts ${a.points}/${m.points}${bothNull ? ' (both rejected — match)' : ''}`);
+              console.log(`${k}: code ${a.code}/${m.code} dist ${a.distance}/${m.distance} dur ${a.duration}/${m.duration} pts ${a.points}/${m.points}${bothNull ? " (both rejected — match)" : ""}`);
               if (!sameCode || !distClose || !durClose || !ptsSame) { console.error(`  MISMATCH on ${k}`); fail = 1; }
             }
             if (fail) process.exit(1);
