@@ -85,14 +85,18 @@ jobs:
       - name: "Image inspect — architecture identity (§10)"
         run: |
           docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" > image-inspect-local.json
-          EXPECTED_ARCH=${{ matrix.arch }}
+          # export is REQUIRED: the Node gate reads process.env, and a plain
+          # shell assignment would leave it undefined (both-arch gate failure
+          # fixed in run 35202265594).
+          export EXPECTED_ARCH=${{ matrix.arch }}
           node -e '
             const i = require("./image-inspect-local.json")[0];
             const want = process.env.EXPECTED_ARCH;
+            if (!want) { console.error("EXPECTED_ARCH not exported to node"); process.exit(1); }
             const okArch = i.Architecture === want && i.Os === "linux";
             const okPort = !!(i.Config.ExposedPorts && i.Config.ExposedPorts["5000/tcp"]);
             const okEp = Array.isArray(i.Config.Entrypoint) && i.Config.Entrypoint.length > 0;
-            console.log(`id=${i.Id} size=${(i.Size/1073741824).toFixed(2)}GiB arch=${i.Architecture}/${i.Os} port5000=${okPort} entrypoint=${okEp}`);
+            console.log(`id=${i.Id} size=${(i.Size/1073741824).toFixed(2)}GiB arch=${i.Architecture}/${i.Os} want=${want} port5000=${okPort} entrypoint=${okEp}`);
             if (!okArch || !okPort || !okEp) process.exit(1);
           '
           ID=$(docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format '{{.Id}}')
